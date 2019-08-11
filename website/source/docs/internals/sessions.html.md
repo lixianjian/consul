@@ -13,11 +13,6 @@ Sessions act as a binding layer between nodes, health checks, and key/value data
 They are designed to provide granular locking and are heavily inspired by
 [The Chubby Lock Service for Loosely-Coupled Distributed Systems](http://research.google.com/archive/chubby.html).
 
-~> **Advanced Topic!** This page covers technical details of
-the internals of Consul. You don't need to know these details to effectively
-operate and use Consul. These details are documented here for those who wish
-to learn about them without having to go spelunking through the source code.
-
 ## Session Design
 
 A session in Consul represents a contract that has very specific semantics.
@@ -120,10 +115,10 @@ lets the current lock holder update the key contents without having to give
 up the lock and reacquire it.
 
 Once held, the lock can be released using a corresponding `release` operation,
-providing the same session. Again, this acts like a Check-And-Set operations
+providing the same session. Again, this acts like a Check-And-Set operation
 since the request will fail if given an invalid session. A critical note is
 that the lock can be released without being the creator of the session.
-This is by design as it allows operators to intervene and force terminate
+This is by design as it allows operators to intervene and force-terminate
 a session if necessary. As mentioned above, a session invalidation will also
 cause all held locks to be released or deleted. When a lock is released, the `LockIndex`
 does not change; however, the `Session` is cleared and the `ModifyIndex` increments.
@@ -144,7 +139,7 @@ the goal of Consul to protect against misbehaving clients.
 
 The primitives provided by sessions and the locking mechanisms of the KV
 store can be used to build client-side leader election algorithms.
-These are covered in more detail in the [Leader Election guide](/docs/guides/leader-election.html).
+These are covered in more detail in the [Leader Election guide](https://learn.hashicorp.com/consul/developer-configuration/elections).
 
 ## Prepared Query Integration
 

@@ -3,10 +3,10 @@ package api
 import (
 	"testing"
 
-	"github.com/hashicorp/consul/testutil/retry"
+	"github.com/hashicorp/consul/sdk/testutil/retry"
 )
 
-func TestEvent_FireList(t *testing.T) {
+func TestAPI_EventFireList(t *testing.T) {
 	t.Parallel()
 	c, s := makeClient(t)
 	defer s.Stop()

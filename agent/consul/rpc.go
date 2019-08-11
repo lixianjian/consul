@@ -2,6 +2,7 @@ package consul
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -9,14 +10,16 @@ import (
 	"time"
 
 	"github.com/armon/go-metrics"
-	"github.com/hashicorp/consul/agent/consul/agent"
 	"github.com/hashicorp/consul/agent/consul/state"
-	"github.com/hashicorp/consul/agent/consul/structs"
+	"github.com/hashicorp/consul/agent/metadata"
 	"github.com/hashicorp/consul/agent/pool"
+	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/lib"
-	"github.com/hashicorp/go-memdb"
+	memdb "github.com/hashicorp/go-memdb"
+	"github.com/hashicorp/go-raftchunking"
 	"github.com/hashicorp/memberlist"
-	"github.com/hashicorp/net-rpc-msgpackrpc"
+	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc"
+	"github.com/hashicorp/raft"
 	"github.com/hashicorp/yamux"
 )
 
@@ -45,11 +48,15 @@ const (
 	enqueueLimit = 30 * time.Second
 )
 
+var (
+	ErrChunkingResubmit = errors.New("please resubmit call for rechunking")
+)
+
 // listen is used to listen for incoming RPC connections
-func (s *Server) listen() {
+func (s *Server) listen(listener net.Listener) {
 	for {
 		// Accept a connection
-		conn, err := s.rpcListener.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			if s.shutdown {
 				return
@@ -59,7 +66,7 @@ func (s *Server) listen() {
 		}
 
 		go s.handleConn(conn, false)
-		metrics.IncrCounter([]string{"consul", "rpc", "accept_conn"}, 1)
+		metrics.IncrCounter([]string{"rpc", "accept_conn"}, 1)
 	}
 }
 
@@ -84,7 +91,7 @@ func (s *Server) handleConn(conn net.Conn, isTLS bool) {
 	typ := pool.RPCType(buf[0])
 
 	// Enforce TLS if VerifyIncoming is set
-	if s.config.VerifyIncoming && !isTLS && typ != pool.RPCTLS {
+	if s.tlsConfigurator.VerifyIncomingRPC() && !isTLS && typ != pool.RPCTLS && typ != pool.RPCTLSInsecure {
 		s.logger.Printf("[WARN] consul.rpc: Non-TLS connection attempted with VerifyIncoming set %s", logConn(conn))
 		conn.Close()
 		return
@@ -96,16 +103,11 @@ func (s *Server) handleConn(conn net.Conn, isTLS bool) {
 		s.handleConsulConn(conn)
 
 	case pool.RPCRaft:
-		metrics.IncrCounter([]string{"consul", "rpc", "raft_handoff"}, 1)
+		metrics.IncrCounter([]string{"rpc", "raft_handoff"}, 1)
 		s.raftLayer.Handoff(conn)
 
 	case pool.RPCTLS:
-		if s.rpcTLS == nil {
-			s.logger.Printf("[WARN] consul.rpc: TLS connection attempted, server not configured for TLS %s", logConn(conn))
-			conn.Close()
-			return
-		}
-		conn = tls.Server(conn, s.rpcTLS)
+		conn = tls.Server(conn, s.tlsConfigurator.IncomingRPCConfig())
 		s.handleConn(conn, true)
 
 	case pool.RPCMultiplexV2:
@@ -114,10 +116,15 @@ func (s *Server) handleConn(conn net.Conn, isTLS bool) {
 	case pool.RPCSnapshot:
 		s.handleSnapshotConn(conn)
 
+	case pool.RPCTLSInsecure:
+		conn = tls.Server(conn, s.tlsConfigurator.IncomingInsecureRPCConfig())
+		s.handleInsecureConn(conn)
+
 	default:
-		s.logger.Printf("[ERR] consul.rpc: unrecognized RPC byte: %v %s", typ, logConn(conn))
-		conn.Close()
-		return
+		if !s.handleEnterpriseRPCConn(typ, conn, isTLS) {
+			s.logger.Printf("[ERR] consul.rpc: unrecognized RPC byte: %v %s", typ, logConn(conn))
+			conn.Close()
+		}
 	}
 }
 
@@ -154,11 +161,33 @@ func (s *Server) handleConsulConn(conn net.Conn) {
 		if err := s.rpcServer.ServeRequest(rpcCodec); err != nil {
 			if err != io.EOF && !strings.Contains(err.Error(), "closed") {
 				s.logger.Printf("[ERR] consul.rpc: RPC error: %v %s", err, logConn(conn))
-				metrics.IncrCounter([]string{"consul", "rpc", "request_error"}, 1)
+				metrics.IncrCounter([]string{"rpc", "request_error"}, 1)
 			}
 			return
 		}
-		metrics.IncrCounter([]string{"consul", "rpc", "request"}, 1)
+		metrics.IncrCounter([]string{"rpc", "request"}, 1)
+	}
+}
+
+// handleInsecureConsulConn is used to service a single Consul INSECURERPC connection
+func (s *Server) handleInsecureConn(conn net.Conn) {
+	defer conn.Close()
+	rpcCodec := msgpackrpc.NewServerCodec(conn)
+	for {
+		select {
+		case <-s.shutdownCh:
+			return
+		default:
+		}
+
+		if err := s.insecureRPCServer.ServeRequest(rpcCodec); err != nil {
+			if err != io.EOF && !strings.Contains(err.Error(), "closed") {
+				s.logger.Printf("[ERR] consul.rpc: INSECURERPC error: %v %s", err, logConn(conn))
+				metrics.IncrCounter([]string{"rpc", "request_error"}, 1)
+			}
+			return
+		}
+		metrics.IncrCounter([]string{"rpc", "request"}, 1)
 	}
 }
 
@@ -173,6 +202,30 @@ func (s *Server) handleSnapshotConn(conn net.Conn) {
 	}()
 }
 
+// canRetry returns true if the given situation is safe for a retry.
+func canRetry(args interface{}, err error) bool {
+	// No leader errors are always safe to retry since no state could have
+	// been changed.
+	if structs.IsErrNoLeader(err) {
+		return true
+	}
+
+	// If we are chunking and it doesn't seem to have completed, try again
+	intErr, ok := args.(error)
+	if ok && strings.Contains(intErr.Error(), ErrChunkingResubmit.Error()) {
+		return true
+	}
+
+	// Reads are safe to retry for stream errors, such as if a server was
+	// being shut down.
+	info, ok := args.(structs.RPCInfo)
+	if ok && info.IsRead() && lib.IsErrEOF(err) {
+		return true
+	}
+
+	return false
+}
+
 // forward is used to forward to a remote DC or to forward to the local leader
 // Returns a bool of if forwarding was performed, as well as any error
 func (s *Server) forward(method string, info structs.RPCInfo, args interface{}, reply interface{}) (bool, error) {
@@ -185,14 +238,21 @@ func (s *Server) forward(method string, info structs.RPCInfo, args interface{}, 
 		return true, err
 	}
 
-	// Check if we can allow a stale read
-	if info.IsRead() && info.AllowStaleRead() {
+	// Check if we can allow a stale read, ensure our local DB is initialized
+	if info.IsRead() && info.AllowStaleRead() && !s.raft.LastContact().IsZero() {
 		return false, nil
 	}
 
 CHECK_LEADER:
+	// Fail fast if we are in the process of leaving
+	select {
+	case <-s.leaveCh:
+		return true, structs.ErrNoLeader
+	default:
+	}
+
 	// Find the leader
-	isLeader, remoteServer := s.getLeader()
+	isLeader, leader := s.getLeader()
 
 	// Handle the case we are the leader
 	if isLeader {
@@ -200,32 +260,39 @@ CHECK_LEADER:
 	}
 
 	// Handle the case of a known leader
-	if remoteServer != nil {
-		err := s.forwardLeader(remoteServer, method, args, reply)
-		return true, err
+	rpcErr := structs.ErrNoLeader
+	if leader != nil {
+		rpcErr = s.connPool.RPC(s.config.Datacenter, leader.Addr,
+			leader.Version, method, leader.UseTLS, args, reply)
+		if rpcErr != nil && canRetry(info, rpcErr) {
+			goto RETRY
+		}
+		return true, rpcErr
 	}
 
+RETRY:
 	// Gate the request until there is a leader
 	if firstCheck.IsZero() {
 		firstCheck = time.Now()
 	}
-	if time.Now().Sub(firstCheck) < s.config.RPCHoldTimeout {
+	if time.Since(firstCheck) < s.config.RPCHoldTimeout {
 		jitter := lib.RandomStagger(s.config.RPCHoldTimeout / jitterFraction)
 		select {
 		case <-time.After(jitter):
 			goto CHECK_LEADER
+		case <-s.leaveCh:
 		case <-s.shutdownCh:
 		}
 	}
 
 	// No leader found and hold time exceeded
-	return true, structs.ErrNoLeader
+	return true, rpcErr
 }
 
 // getLeader returns if the current node is the leader, and if not then it
 // returns the leader which is potentially nil if the cluster has not yet
 // elected a leader.
-func (s *Server) getLeader() (bool, *agent.Server) {
+func (s *Server) getLeader() (bool, *metadata.Server) {
 	// Check if we are the leader
 	if s.IsLeader() {
 		return true, nil
@@ -238,21 +305,10 @@ func (s *Server) getLeader() (bool, *agent.Server) {
 	}
 
 	// Lookup the server
-	s.localLock.RLock()
-	server := s.localConsuls[leader]
-	s.localLock.RUnlock()
+	server := s.serverLookup.Server(leader)
 
 	// Server could be nil
 	return false, server
-}
-
-// forwardLeader is used to forward an RPC call to the leader, or fail if no leader
-func (s *Server) forwardLeader(server *agent.Server, method string, args interface{}, reply interface{}) error {
-	// Handle a missing server
-	if server == nil {
-		return structs.ErrNoLeader
-	}
-	return s.connPool.RPC(s.config.Datacenter, server.Addr, server.Version, method, server.UseTLS, args, reply)
 }
 
 // forwardDC is used to forward an RPC call to a remote DC, or fail if no servers
@@ -263,7 +319,8 @@ func (s *Server) forwardDC(method, dc string, args interface{}, reply interface{
 		return structs.ErrNoDCPath
 	}
 
-	metrics.IncrCounter([]string{"consul", "rpc", "cross-dc", dc}, 1)
+	metrics.IncrCounterWithLabels([]string{"rpc", "cross-dc"}, 1,
+		[]metrics.Label{{Name: "datacenter", Value: dc}})
 	if err := s.connPool.RPC(dc, server.Addr, server.Version, method, server.UseTLS, args, reply); err != nil {
 		manager.NotifyFailedServer(server)
 		s.logger.Printf("[ERR] consul: RPC failed to server %s in DC %q: %v", server.Addr, dc, err)
@@ -279,11 +336,13 @@ func (s *Server) forwardDC(method, dc string, args interface{}, reply interface{
 func (s *Server) globalRPC(method string, args interface{},
 	reply structs.CompoundResponse) error {
 
-	errorCh := make(chan error)
-	respCh := make(chan interface{})
-
 	// Make a new request into each datacenter
 	dcs := s.router.GetDatacenters()
+
+	replies, total := 0, len(dcs)
+	errorCh := make(chan error, total)
+	respCh := make(chan interface{}, total)
+
 	for _, dc := range dcs {
 		go func(dc string) {
 			rr := reply.New()
@@ -295,7 +354,6 @@ func (s *Server) globalRPC(method string, args interface{},
 		}(dc)
 	}
 
-	replies, total := 0, len(dcs)
 	for replies < total {
 		select {
 		case err := <-errorCh:
@@ -321,12 +379,43 @@ func (s *Server) raftApply(t structs.MessageType, msg interface{}) (interface{},
 		s.logger.Printf("[WARN] consul: Attempting to apply large raft entry (%d bytes)", n)
 	}
 
-	future := s.raft.Apply(buf, enqueueLimit)
+	var chunked bool
+	var future raft.ApplyFuture
+	switch {
+	case len(buf) <= raft.SuggestedMaxDataSize || t != structs.KVSRequestType:
+		future = s.raft.Apply(buf, enqueueLimit)
+	default:
+		chunked = true
+		future = raftchunking.ChunkingApply(buf, nil, enqueueLimit, s.raft.ApplyLog)
+	}
+
 	if err := future.Error(); err != nil {
 		return nil, err
 	}
 
-	return future.Response(), nil
+	resp := future.Response()
+
+	if chunked {
+		// In this case we didn't apply all chunks successfully, possibly due
+		// to a term change; resubmit
+		if resp == nil {
+			// This returns the error in the interface because the raft library
+			// returns errors from the FSM via the future, not via err from the
+			// apply function. Downstream client code expects to see any error
+			// from the FSM (as opposed to the apply itself) and decide whether
+			// it can retry in the future's response.
+			return ErrChunkingResubmit, nil
+		}
+		// We expect that this conversion should always work
+		chunkedSuccess, ok := resp.(raftchunking.ChunkingSuccess)
+		if !ok {
+			return nil, errors.New("unknown type of response back from chunking FSM")
+		}
+		// Return the inner wrapped response
+		return chunkedSuccess.Response, nil
+	}
+
+	return resp, nil
 }
 
 // queryFn is used to perform a query operation. If a re-query is needed, the
@@ -372,7 +461,7 @@ RUN_QUERY:
 	}
 
 	// Run the query.
-	metrics.IncrCounter([]string{"consul", "rpc", "query"}, 1)
+	metrics.IncrCounter([]string{"rpc", "query"}, 1)
 
 	// Operate on a consistent set of state. This makes sure that the
 	// abandon channel goes with the state that the caller is using to
@@ -391,7 +480,18 @@ RUN_QUERY:
 
 	// Block up to the timeout if we didn't see anything fresh.
 	err := fn(ws, state)
-	if err == nil && queryMeta.Index > 0 && queryMeta.Index <= queryOpts.MinQueryIndex {
+	// Note we check queryOpts.MinQueryIndex is greater than zero to determine if
+	// blocking was requested by client, NOT meta.Index since the state function
+	// might return zero if something is not initialized and care wasn't taken to
+	// handle that special case (in practice this happened a lot so fixing it
+	// systematically here beats trying to remember to add zero checks in every
+	// state method). We also need to ensure that unless there is an error, we
+	// return an index > 0 otherwise the client will never block and burn CPU and
+	// requests.
+	if err == nil && queryMeta.Index < 1 {
+		queryMeta.Index = 1
+	}
+	if err == nil && queryOpts.MinQueryIndex > 0 && queryMeta.Index <= queryOpts.MinQueryIndex {
 		if expired := ws.Watch(timeout.C); !expired {
 			// If a restore may have woken us up then bail out from
 			// the query immediately. This is slightly race-ey since
@@ -414,7 +514,7 @@ func (s *Server) setQueryMeta(m *structs.QueryMeta) {
 		m.LastContact = 0
 		m.KnownLeader = true
 	} else {
-		m.LastContact = time.Now().Sub(s.raft.LastContact())
+		m.LastContact = time.Since(s.raft.LastContact())
 		m.KnownLeader = (s.raft.Leader() != "")
 	}
 }
@@ -422,7 +522,7 @@ func (s *Server) setQueryMeta(m *structs.QueryMeta) {
 // consistentRead is used to ensure we do not perform a stale
 // read. This is done by verifying leadership before the read.
 func (s *Server) consistentRead() error {
-	defer metrics.MeasureSince([]string{"consul", "rpc", "consistentRead"}, time.Now())
+	defer metrics.MeasureSince([]string{"rpc", "consistentRead"}, time.Now())
 	future := s.raft.VerifyLeader()
 	if err := future.Error(); err != nil {
 		return err //fail fast if leader verification fails

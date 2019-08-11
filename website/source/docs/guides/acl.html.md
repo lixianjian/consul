@@ -1,703 +1,472 @@
 ---
 layout: "docs"
-page_title: "ACL System"
+page_title: "Bootstrapping ACLs"
 sidebar_current: "docs-guides-acl"
 description: |-
   Consul provides an optional Access Control List (ACL) system which can be used to control access to data and APIs. The ACL system is a Capability-based system that relies on tokens which can have fine grained rules applied to them. It is very similar to AWS IAM in many ways.
 ---
 
-# ACL System
+# Bootstrapping the ACL System
 
-Consul provides an optional Access Control List (ACL) system which can be used to control
-access to data and APIs. The ACL is
-[Capability-based](https://en.wikipedia.org/wiki/Capability-based_security), relying
-on tokens to which fine grained rules can be applied. It is very similar to
-[AWS IAM](http://aws.amazon.com/iam/) in many ways.
+Consul uses Access Control Lists (ACLs) to secure the UI, API, CLI, service communications, and agent communications. For securing gossip and RPC communication please review [this guide](/docs/guides/agent-encryption.html). When securing your cluster you should configure the ACLs first. 
 
-## ACL System Overview
+At the core, ACLs operate by grouping rules into policies, then associating one or more policies with a token.
 
-The ACL system is designed to be easy to use, fast to enforce, and flexible to new policies,
-all while providing administrative insight.
+To complete this guide, you should have an operational Consul 1.4+ cluster. We also recommend reading the [ACL System documentation](/docs/agent/acl-system.html). For securing Consul version 1.3 and older, please read the [legacy ACL documentation](https://www.consul.io/docs/guides/acl-legacy.html).
 
-#### ACL Tokens
+Bootstrapping the ACL system is a multi-step process, we will cover all the necessary steps in this guide. 
 
-The ACL system is based on tokens, which are managed by Consul operators via Consul's
-[ACL API](/api/acl.html), or systems like
-[HashiCorp's Vault](https://www.vaultproject.io/docs/secrets/consul/index.html).
+* [Enable ACLs on all the servers](/docs/guides/acl.html#step-1-enable-acls-on-all-the-consul-servers).
+* [Create the initial bootstrap token](/docs/guides/acl.html#step-2-create-the-bootstrap-token).
+* [Create the agent policy](/docs/guides/acl.html#step-3-create-an-agent-token-policy).
+* [Create the agent token](/docs/guides/acl.html#step-4-create-an-agent-token).
+* [Apply the new token to the servers](/docs/guides/acl.html#step-5-add-the-agent-token-to-all-the-servers). 
+* [Enable ACLs on the clients and apply the agent token](/docs/guides/acl.html#step-6-enable-acls-on-the-consul-clients).
 
-Every token has an ID, name, type, and rule set. The ID is a randomly generated
-UUID, making it infeasible to guess. The name is opaque to Consul and human readable.
-The type is either "client" (meaning the token cannot modify ACL rules) or "management"
-(meaning the token is allowed to perform all actions).
+At the end of this guide, there are also several additional and optional steps.
 
-The token ID is passed along with each RPC request to the servers. Consul's
-[HTTP endpoints](http://localhost:4567/api/index.html) can accept tokens via the `token`
-query string parameter, or the `X-Consul-Token` request header. Consul's
-[CLI commands](http://localhost:4567/docs/commands/index.html) can accept tokens via the
-`token` argument, or the `CONSUL_HTTP_TOKEN` environment variable.
+## Step 1: Enable ACLs on all the Consul Servers
 
-If no token is provided, the rules associated with a special, configurable anonymous
-token are automatically applied. The anonymous token is managed using the
-[ACL API](/api/acl.html) like any other ACL token, but using `anonymous` for the ID.
-
-#### ACL Rules and Scope
-
-Tokens are bound to a set of rules that control which Consul resources the token
-has access to. Policies can be defined in either a whitelist or blacklist mode
-depending on the configuration of
-[`acl_default_policy`](/docs/agent/options.html#acl_default_policy). If the default
-policy is to "deny all" actions, then token rules can be set to whitelist specific
-actions. In the inverse, the "allow all" default behavior is a blacklist where rules
-are used to prohibit actions. By default, Consul will allow all actions.
-
-The following table summarizes the ACL policies that are available for constructing
-rules:
-
-| Policy                   | Scope |
-| ------------------------ | ----- |
-| [`agent`](#agent-rules)          | Utility operations in the [Agent API](/api/agent.html), other than service and check registration |
-| [`event`](#event-rules)          | Listing and firing events in the [Event API](/api/event.html) |
-| [`key`](#key-value-rules)        | Key/value store operations in the [KV Store API](/api/kv.html) |
-| [`keyring`](#keyring-rules)      | Keyring operations in the [Keyring API](/api/operator/keyring.html) |
-| [`node`](#node-rules)            | Node-level catalog operations in the [Catalog API](/api/catalog.html), [Health API](/api/health.html), [Prepared Query API](/api/query.html), [Network Coordinate API](/api/coordinate.html), and [Agent API](/api/agent.html) |
-| [`operator`](#operator-rules)    | Cluster-level operations in the [Operator API](/api/operator.html), other than the [Keyring API](/api/operator/keyring.html) |
-| [`query`](#prepared-query-rules) | Prepared query operations in the [Prepared Query API](/api/query.html)
-| [`service`](#service-rules)      | Service-level catalog operations in the [Catalog API](/api/catalog.html), [Health API](/api/health.html), [Prepared Query API](/api/query.html), and [Agent API](/api/agent.html) |
-| [`session`](#session-rules)      | Session operations in the [Session API](/api/session.html) |
-
-Since Consul snapshots actually contain ACL tokens, the
-[Snapshot API](/api/snapshot.html) requires a management token for snapshot operations
-and does not use a special policy.
-
-The following resources are not covered by ACL policies:
-
-1. The [Status API](/api/status.html) is used by servers when bootstrapping and exposes
-basic IP and port information about the servers, and does not allow modification
-of any state.
-
-2. The datacenter listing operation of the
-[Catalog API](/api/catalog.html#list-datacenters) similarly exposes the names of known
-Consul datacenters, and does not allow modification of any state.
-
-Constructing rules from these policies is covered in detail in the
-[Rule Specification](#rule-specification) section below.
-
-#### ACL Datacenter
-
-All nodes (clients and servers) must be configured with an
-[`acl_datacenter`](/docs/agent/options.html#acl_datacenter) which enables ACL
-enforcement but also specifies the authoritative datacenter. Consul relies on
-[RPC forwarding](/docs/internals/architecture.html) to support multi-datacenter
-configurations. However, because requests can be made across datacenter boundaries,
-ACL tokens must be valid globally. To avoid consistency issues, a single datacenter
-is considered authoritative and stores the canonical set of tokens.
-
-When a request is made to an agent in a non-authoritative datacenter, it must be
-resolved into the appropriate policy. This is done by reading the token from the
-authoritative server and caching the result for a configurable
-[`acl_ttl`](/docs/agent/options.html#acl_ttl). The implication of caching is that
-the cache TTL is an upper bound on the staleness of policy that is enforced. It is
-possible to set a zero TTL, but this has adverse performance impacts, as every
-request requires refreshing the policy via an RPC call.
-
-#### Enabling ACLs
-
-Enabling ACLs is done by setting up the following configuration options. These are
-marked as to whether they are set on servers, clients, or both.
-
-| Configuration Option | Servers | Clients | Purpose |
-| -------------------- | ------- | ------- | ------- |
-| [`acl_datacenter`](/docs/agent/options.html#acl_datacenter) | `REQUIRED` | `REQUIRED` | Master control that enables ACLs by defining the authoritative Consul datacenter for ACLs |
-| [`acl_default_policy`](/docs/agent/options.html#acl_default_policy) | `OPTIONAL` | `N/A` | Determines whitelist or blacklist mode |
-| [`acl_down_policy`](/docs/agent/options.html#acl_down_policy) | `OPTIONAL` | `OPTIONAL` | Determines what to do when the ACL datacenter is offline |
-| [`acl_ttl`](/docs/agent/options.html#acl_ttl) | `OPTIONAL` | `OPTIONAL` | Determines time-to-live for cached ACLs |
-
-There are some additional configuration items related to [ACL replication](#replication) and
-[Version 8 ACL support](#version_8_acls). These are discussed in those respective sections
-below.
-
-A number of special tokens can also be configured which allow for bootstrapping the ACL
-system, or accessing Consul in special situations:
-
-| Special Token | Servers | Clients | Purpose |
-| ------------- | ------- | ------- | ------- |
-| [`acl_agent_master_token`](/docs/agent/options.html#acl_agent_master_token) | `OPTIONAL` | `OPTIONAL` | Special token that can be used to access [Agent API](/api/agent.html) when the ACL datacenter isn't available, or servers are offline (for clients); used for setting up the cluster such as doing initial join operations |
-| [`acl_agent_token`](/docs/agent/options.html#acl_agent_token) | `OPTIONAL` | `OPTIONAL` | Special token that is used for an agent's internal operations with the [Catalog API](/api/catalog.html); this needs to have at least `node` policy access so the agent can self update its registration information |
-| [`acl_master_token`](/docs/agent/options.html#acl_master_token) | `REQUIRED` | `N/A` | Special token used to bootstrap the ACL system, see details below. |
-| [`acl_token`](/docs/agent/options.html#acl_token) | `OPTIONAL` | `OPTIONAL` | Default token to use for client requests where no token is supplied; this is often configured with read-only access to services to enable DNS service discovery on agents |
-
-Bootstrapping the ACL system is done by providing an initial
-[`acl_master_token`](/docs/agent/options.html#acl_master_token) which will be created
-as a "management" type token if it does not exist. The
-[`acl_master_token`](/docs/agent/options.html#acl_master_token) is only installed when
-a server acquires cluster leadership. If you would like to install or change the
-[`acl_master_token`](/docs/agent/options.html#acl_master_token), set the new value for
-[`acl_master_token`](/docs/agent/options.html#acl_master_token) in the configuration
-for all servers. Once this is done, restart the current leader to force a leader election.
-
-Once the ACL system is bootstrapped, ACL tokens can be managed through the
-[ACL API](/api/acl.html).
-
-## Rule Specification
-
-A core part of the ACL system is the rule language which is used to describe the policy
-that must be enforced. Most of the ACL rules are prefix-based, allowing operators to
-define different namespaces within Consul's resource areas like the catalog and key/value
-store, in order to delegate responsibility for these namespaces. Policies can have several
-dispositions:
-
-* `read`: allow the resource to be read but not modified
-* `write`: allow the resource to be read and modified
-* `deny`: do not allow the resource to be read or modified
-
-With prefix-based rules, the most specific prefix match determines the action. This
-allows for flexible rules like an empty prefix to allow read-only access to all
-resources, along with some specific prefixes that allow write access or that are
-denied all access.
-
-We make use of the
-[HashiCorp Configuration Language (HCL)](https://github.com/hashicorp/hcl/) to specify
-rules. This language is human readable and interoperable with JSON making it easy to
-machine-generate. Rules can make use of one or more policies.
-
-Specification in the HCL format looks like:
-
-```text
-# These control access to the key/value store.
-key "" {
-  policy = "read"
-}
-key "foo/" {
-  policy = "write"
-}
-key "foo/private/" {
-  policy = "deny"
-}
-
-# This controls access to cluster-wide Consul operator information.
-operator = "read"
-```
-
-This is equivalent to the following JSON input:
-
-```javascript
-{
-  "key": {
-    "": {
-      "policy": "read"
-    },
-    "foo/": {
-      "policy": "write"
-    },
-    "foo/private/": {
-      "policy": "deny"
-    }
-  },
-  "operator": "read"
-}
-```
-
-The [ACL API](/api/acl.html) allows either HCL or JSON to be used to define the content
-of the rules section.
-
-Here's a sample request using the HCL form:
-
-```text
-$ curl \
-    --request PUT \
-    --data \
-'{
-  "Name": "my-app-token",
-  "Type": "client",
-  "Rules": "key \"\" { policy = \"read\" } key \"foo/\" { policy = \"write\" } key \"foo/private/\" { policy = \"deny\" } operator = \"read\""
-}' https://consul.rocks/v1/acl/create?token=<management token>
-```
-
-Here's an equivalent request using the JSON form:
-
-```text
-$ curl \
-    --request PUT \
-    --data \
-'{
-  "Name": "my-app-token",
-  "Type": "client",
-  "Rules": "{\"key\":{\"\":{\"policy\":\"read\"},\"foo/\":{\"policy\":\"write\"},\"foo/private\":{\"policy\":\"deny\"}},\"operator\":\"read\"}"
-}' https://consul.rocks/v1/acl/create?token=<management token>
-```
-
-On success, the token ID is returned:
+The first step for bootstrapping the ACL system is to enable ACLs on the Consul servers in the agent configuration file. In this example, we are configuring the default policy of "deny", which means we are in whitelist mode, and a down policy of "extend-cache", which means that we will ignore token TTLs during an outage.
 
 ```json
 {
-  "ID": "adf4238a-882b-9ddc-4a9d-5b6758e4159e"
+  "acl" : {
+    "enabled" : true,
+    "default_policy" : "deny",
+    "down_policy" : "extend-cache"
+  }
 }
 ```
 
-This token ID can then be passed into Consul's HTTP APIs via the `token`
-query string parameter, or the `X-Consul-Token` request header, or Consul's
-CLI commands via the `token` argument, or the `CONSUL_HTTP_TOKEN` environment
-variable.
+The servers will need to be restarted to load the new configuration. Please take care
+to restart the servers one at a time and ensure each server has joined and is operating
+correctly before restarting another.
 
-#### Agent Rules
+If ACLs are enabled correctly, we will now see the following warnings and info in the leader's logs.
 
-The `agent` policy controls access to the utility operations in the [Agent API](/api/agent.html),
-such as join and leave. All of the catalog-related operations are covered by the [`node`](#node-rules)
-and [`service`](#service-rules) policies instead.
+```sh
+2018/12/12 01:36:40 [INFO] acl: Created the anonymous token
+2018/12/12 01:36:40 [INFO] consul: ACL bootstrap enabled
+2018/12/12 01:36:41 [INFO] agent: Synced node info
+2018/12/12 01:36:58 [WARN] agent: Coordinate update blocked by ACLs
+2018/12/12 01:37:40 [INFO] acl: initializing acls
+2018/12/12 01:37:40 [INFO] consul: Created ACL 'global-management' policy
+```
 
-Agent rules look like this:
+If you do not see ACL bootstrap enabled, the anonymous token creation, and the `global-management` policy creation message in the logs, ACLs have not been properly enabled. 
 
-```text
-agent "" {
-  policy = "read"
+Note, now that we have enabled ACLs, we will need a token to complete any operation. We can't do anything else to the cluster until we bootstrap and generate the first master token. For simplicity we will use the master token created during the bootstrap for the remainder of the guide.
+
+## Step 2: Create the Bootstrap Token
+
+Once ACLs have been enabled we can bootstrap our first token, the bootstrap token. 
+The bootstrap token is a management token with unrestricted privileges. It will
+be shared with all the servers in the quorum, since it will be added to the 
+state store. 
+
+```bash
+$ consul acl bootstrap
+AccessorID: edcaacda-b6d0-1954-5939-b5aceaca7c9a
+SecretID: 4411f091-a4c9-48e6-0884-1fcb092da1c8
+Description: Bootstrap Token (Global Management)
+Local: false
+Create Time: 2018-12-06 18:03:23.742699239 +0000 UTC
+Policies:
+00000000-0000-0000-0000-000000000001 - global-management
+```
+
+On the server where the `bootstrap` command was issued we should see the following log message. 
+
+```sh
+2018/12/11 15:30:23 [INFO] consul.acl: ACL bootstrap completed
+2018/12/11 15:30:23 [DEBUG] http: Request PUT /v1/acl/bootstrap (2.347965ms) from=127.0.0.1:40566
+```
+
+Since ACLs have been enabled, we will need to use it to complete any additional operations.
+For example, even checking the member list will require a token.  
+
+```sh
+$ consul members -token "4411f091-a4c9-48e6-0884-1fcb092da1c8"
+Node  Address            Status  Type    Build  Protocol  DC   Segment
+fox   172.20.20.10:8301  alive   server  1.4.0  2         kc  <all>
+bear  172.20.20.11:8301  alive   server  1.4.0  2         kc  <all>
+wolf  172.20.20.12:8301  alive   server  1.4.0  2         kc  <all>
+```
+
+Note using the token on the command line with the `-token` flag is not 
+recommended, instead we will set it as an environment variable once.
+
+```sh
+$ export CONSUL_HTTP_TOKEN=4411f091-a4c9-48e6-0884-1fcb092da1c8
+```
+
+The bootstrap token can also be used in the server configuration file as 
+the [`master`](https://www.consul.io/docs/agent/options.html#acl_tokens_master) token.
+
+Note, the bootstrap token can only be created once, bootstrapping will be disabled after the master token was created. Once the ACL system is bootstrapped, ACL tokens can be managed through the
+[ACL API](/api/acl/acl.html).
+
+## Step 3: Create an Agent Token Policy
+
+Before we can create a token, we will need to create its associated policy. A policy is a set of rules that can be used to specify granular permissions. To learn more about rules, read the ACL rule specification [documentation](/docs/agent/acl-rules.html).
+
+```bash
+# agent-policy.hcl contains the following:
+node_prefix "" {
+   policy = "write"
 }
-agent "foo" {
-  policy = "write"
-}
-agent "bar" {
-  policy = "deny"
+service_prefix "" {
+   policy = "read"
 }
 ```
 
-Agent rules are keyed by the node name prefix they apply to, using the longest prefix match rule. In
-the example above, the rules allow read-only access to any node name with the empty prefix, allow
-read-write access to any node name that starts with "foo", and deny all access to any node name that
-starts with "bar".
+This policy will allow all nodes to be registered and accessed and any service to be read. 
+Note, this simple policy is not recommended in production.
+It is best practice to create separate node policies and tokens for each node in the cluster
+with an exact-match node rule.
 
-Since [Agent API](/api/agent.html) utility operations may be required before an agent is joined to
-a cluster, or during an outage of the Consul servers or ACL datacenter, a special token may be
-configured with [`acl_agent_master_token`](/docs/agent/options.html#acl_agent_master_token) to allow
-write access to these operations even if no ACL resolution capability is available.
+We only need to create one policy and can do this on any of the servers. If you have not set the 
+`CONSUL_HTTP_TOKEN` environment variable to the bootstrap token, please refer to the previous step. 
 
-#### Event Rules
-
-The `event` policy controls access to event operations in the [Event API](/api/event.html), such as
-firing events and listing events.
-
-Event rules look like this:
-
-```text
-event "" {
-  policy = "read"
+```
+$ consul acl policy create -name "agent-token" -description "Agent Token Policy" -rules @agent-policy.hcl
+ID:           5102b76c-6058-9fe7-82a4-315c353eb7f7
+Name:         agent-policy
+Description:  Agent Token Policy
+Datacenters:
+Rules:
+node_prefix "" {
+   policy = "write"
 }
-event "deploy" {
-  policy = "write"
+service_prefix "" {
+   policy = "read"
 }
 ```
 
-Event rules are keyed by the event name prefix they apply to, using the longest prefix match rule.
-In the example above, the rules allow read-only access to any event, and firing of any event that
-starts with "deploy".
+The returned value is the newly-created policy that we can now use when creating our agent token. 
 
-The [`consul exec`](/docs/commands/exec.html) command uses events with the "_rexec" prefix during
-operation, so to enable this feature in a Consul environment with ACLs enabled, you will need to
-give agents a token with access to this event prefix, in addition to configuring
-[`disable_remote_exec`](/docs/agent/options.html#disable_remote_exec) to `false`.
+## Step 4: Create an Agent Token
 
-#### Key/Value Rules
+Using the newly created policy, we can create an agent token. Again we can complete this process on any of the servers. For this guide, all agents will share the same token. Note, the `SecretID` is the token used to authenticate API and CLI commands. 
 
-The `key` policy controls access to key/value store operations in the [KV API](/api/kv.html). Key
-rules look like this:
+```sh
+$ consul acl token create -description "Agent Token" -policy-name "agent-token"
+AccessorID:   499ab022-27f2-acb8-4e05-5a01fff3b1d1
+SecretID:     da666809-98ca-0e94-a99c-893c4bf5f9eb
+Description:  Agent Token
+Local:        false
+Create Time:  2018-10-19 14:23:40.816899 -0400 EDT
+Policies:
+   fcd68580-c566-2bd2-891f-336eadc02357 - agent-token
+```
 
-```text
-key "" {
-  policy = "read"
-}
-key "foo" {
-  policy = "write"
-}
-key "bar" {
-  policy = "deny"
+## Step 5: Add the Agent Token to all the Servers
+
+Our final step for configuring the servers is to assign the token to all of our
+Consul servers via the configuration file and reload the Consul service 
+on all of the servers, one last time.
+
+```json
+{
+  "primary_datacenter": "dc1",
+  "acl" : {
+    "enabled" : true,
+    "default_policy" : "deny",
+    "down_policy" : "extend-cache",
+    "tokens" : {
+      "agent" : "da666809-98ca-0e94-a99c-893c4bf5f9eb"
+    }
+  }
 }
 ```
 
-Key rules are keyed by the key name prefix they apply to, using the longest prefix match rule. In
-the example above, the rules allow read-only access to any key name with the empty prefix, allow
-read-write access to any key name that starts with "foo", and deny all access to any key name that
-starts with "bar".
+~> Note: In Consul version 1.4.2 and older any ACL updates
+in the agent configuration file will require a full restart of the 
+Consul service. 
 
-#### Keyring Rules
+At this point we should no longer see the coordinate warning in the servers logs, however, we should continue to see that the node information is in sync.
 
-The `keyring` policy controls access to keyring operations in the
-[Keyring API](/api/operator/keyring.html).
-
-Keyring rules look like this:
-
-```text
-keyring = "write"
+```sh
+2018/12/11 15:34:20 [DEBUG] agent: Node info in sync
 ```
 
-There's only one keyring policy allowed per rule set, and its value is set to one of the policy
-dispositions. In the example above, the keyring may be read and updated.
+It is important to ensure the servers are configured properly, before enable ACLs 
+on the clients. This will reduce any duplicate work and troubleshooting, if there
+is a misconfiguration.  
 
-#### Node Rules
+#### Ensure the ACL System is Configured Properly
 
-The `node` policy controls node-level registration and read access to the [Catalog API](/api/catalog.html),
-service discovery with the [Health API](/api/health.html), and filters results in [Agent API](/api/agent.html)
-operations like fetching the list of cluster members.
+Before configuring the clients, we should check that the servers are healthy. To do this, let's view the catalog.
 
-Node rules look like this:
+```sh
+curl http://127.0.0.1:8500/v1/catalog/nodes -H 'x-consul-token: 4411f091-a4c9-48e6-0884-1fcb092da1c8' 
+[
+    {
+        "Address": "172.20.20.10",
+        "CreateIndex": 7,
+        "Datacenter": "kc",
+        "ID": "881cfb69-2bcd-c2a9-d87c-cb79fc454df9",
+        "Meta": {
+            "consul-network-segment": ""
+        },
+        "ModifyIndex": 10,
+        "Node": "fox",
+        "TaggedAddresses": {
+            "lan": "172.20.20.10",
+            "wan": "172.20.20.10"
+        }
+    }
+]
+``` 
 
-```text
-node "" {
-  policy = "read"
-}
-node "app" {
-  policy = "write"
-}
-node "admin" {
-  policy = "deny"
-}
+All the values should be as expected. Particularly, if `TaggedAddresses` is `null` it is likely we have not configured ACLs correctly. A good place to start debugging is reviewing the Consul logs on all the servers.
+
+If you encounter issues that are unresolvable, or misplace the bootstrap token, you can reset the ACL system by updating the index. First re-run the bootstrap command to get the index number.
+
+```
+$ consul acl bootstrap
+Failed ACL bootstrapping: Unexpected response code: 403 (Permission denied: ACL bootstrap no longer allowed (reset index: 13))
 ```
 
-Node rules are keyed by the node name prefix they apply to, using the longest prefix match rule. In
-the example above, the rules allow read-only access to any node name with the empty prefix, allow
-read-write access to any node name that starts with "app", and deny all access to any node name that
-starts with "admin".
+Then write the reset index into the bootstrap reset file: (here the reset index is 13)
 
-Agents need to be configured with an [`acl_agent_token`](/docs/agent/options.html#acl_agent_token)
-with at least "write" privileges to their own node name in order to register their information with
-the catalog, such as node metadata and tagged addresses. If this is configured incorrectly, the agent
-will print an error to the console when it tries to sync its state with the catalog.
-
-Consul's DNS interface is also affected by restrictions on node rules. If the
-[`acl_token`](/docs/agent/options.html#acl_token) used by the agent does not have "read" access to a
-given node, then the DNS interface will return no records when queried for it.
-
-When reading from the catalog or retrieving information from the health endpoints, node rules are
-used to filter the results of the query. This allows for configurations where a token has access
-to a given service name, but only on an allowed subset of node names.
-
-Node rules come into play when using the [Agent API](/api/agent.html) to register node-level
-checks. The agent will check tokens locally as a check is registered, and Consul also performs
-periodic [anti-entropy](/docs/internals/anti-entropy.html) syncs, which may require an
-ACL token to complete. To accommodate this, Consul provides two methods of configuring ACL tokens
-to use for registration events:
-
-1. Using the [acl_token](/docs/agent/options.html#acl_token) configuration
-   directive. This allows a single token to be configured globally and used
-   during all check registration operations.
-2. Providing an ACL token with service and check definitions at
-   registration time. This allows for greater flexibility and enables the use
-   of multiple tokens on the same agent. Examples of what this looks like are
-   available for both [services](/docs/agent/services.html) and
-   [checks](/docs/agent/checks.html). Tokens may also be passed to the
-   [HTTP API](/api/index.html) for operations that require them.
-
-#### Operator Rules
-
-The `operator` policy controls access to cluster-level operations in the
-[Operator API](/api/operator.html), other than the [Keyring API](/api/operator/keyring.html).
-
-Operator rules look like this:
-
-```text
-operator = "read"
+```
+$ echo 13 >> <data-directory>/acl-bootstrap-reset
 ```
 
-There's only one operator policy allowed per rule set, and its value is set to one of the policy
-dispositions. In the example above, the token could be used to query the operator endpoints for
-diagnostic purposes but not make any changes.
+After reseting the ACL system you can start again at Step 2. 
 
-#### Prepared Query Rules
+## Step 6: Enable ACLs on the Consul Clients
 
-The `query` policy controls access to create, update, and delete prepared queries in the
-[Prepared Query API](/api/query.html). Executing queries is subject to `node` and `service`
-policies, as will be explained below.
+Since ACL enforcement also occurs on the Consul clients, we need to also restart them
+with a configuration file that enables ACLs. We can use the same ACL agent token that we created for the servers. The same token can be used because we did not specify any node or service prefixes.
 
-Query rules look like this:
-
-```text
-query "" {
-  policy = "read"
-}
-query "foo" {
-  policy = "write"
+```json
+{
+  "acl" : {
+    "enabled" : true,
+    "down_policy" : "extend-cache",
+    "tokens" : {
+      "agent" : "da666809-98ca-0e94-a99c-893c4bf5f9eb"
+    }
+  }
 }
 ```
 
-Query rules are keyed by the query name prefix they apply to, using the longest prefix match rule. In
-the example above, the rules allow read-only access to any query name with the empty prefix, and allow
-read-write access to any query name that starts with "foo". This allows control of the query namespace
-to be delegated based on ACLs.
+To ensure the agent's are configured correctly, we can again use the `/catalog` endpoint. 
 
-There are a few variations when using ACLs with prepared queries, each of which uses ACLs in one of two
-ways: open, protected by unguessable IDs or closed, managed by ACL policies. These variations are covered
-here, with examples:
+## Additional ACL Configuration
 
-* Static queries with no `Name` defined are not controlled by any ACL policies.
-  These types of queries are meant to be ephemeral and not shared to untrusted
-  clients, and they are only reachable if the prepared query ID is known. Since
-  these IDs are generated using the same random ID scheme as ACL Tokens, it is
-  infeasible to guess them. When listing all prepared queries, only a management
-  token will be able to see these types, though clients can read instances for
-  which they have an ID. An example use for this type is a query built by a
-  startup script, tied to a session, and written to a configuration file for a
-  process to use via DNS.
+Now that the nodes have been configured to use ACLs, we can configure the CLI, UI, and nodes to use specific tokens. All of the following steps are optional examples. In your own environment you will likely need to create more fine grained policies.
 
-* Static queries with a `Name` defined are controlled by the `query` ACL policy.
-  Clients are required to have an ACL token with a prefix sufficient to cover
-  the name they are trying to manage, with a longest prefix match providing a
-  way to define more specific policies. Clients can list or read queries for
-  which they have "read" access based on their prefix, and similar they can
-  update any queries for which they have "write" access. An example use for
-  this type is a query with a well-known name (eg. `prod-master-customer-db`)
-  that is used and known by many clients to provide geo-failover behavior for
-  a database.
+#### Configure the Anonymous Token (Optional)
 
-* [Template queries](/api/query.html#templates)
-  queries work like static queries with a `Name` defined, except that a catch-all
-  template with an empty `Name` requires an ACL token that can write to any query
-  prefix.
+The anonymous token is created during the bootstrap process, `consul acl bootstrap`. It is implicitly used if no token is supplied. In this section we will update the existing token with a newly created policy.
 
-When prepared queries are executed via DNS lookups or HTTP requests, the ACL
-checks are run against the service being queried, similar to how ACLs work with
-other service lookups. There are several ways the ACL token is selected for this
-check:
+At this point ACLs are bootstrapped with ACL agent tokens configured, but there are no
+other policies set up. Even basic operations like `consul members` will be restricted
+by the ACL default policy of "deny":
 
-* If an ACL Token was captured when the prepared query was defined, it will be
-  used to perform the service lookup. This allows queries to be executed by
-  clients with lesser or even no ACL Token, so this should be used with care.
-
-* If no ACL Token was captured, then the client's ACL Token will be used to
-  perform the service lookup.
-
-* If no ACL Token was captured and the client has no ACL Token, then the
-  anonymous token will be used to perform the service lookup.
-
-In the common case, the ACL Token of the invoker is used
-to test the ability to look up a service. If a `Token` was specified when the
-prepared query was created, the behavior changes and now the captured
-ACL Token set by the definer of the query is used when looking up a service.
-
-Capturing ACL Tokens is analogous to
-[PostgreSQL’s](http://www.postgresql.org/docs/current/static/sql-createfunction.html)
-`SECURITY DEFINER` attribute which can be set on functions, and using the client's ACL
-Token is similar to the complementary `SECURITY INVOKER` attribute.
-
-Prepared queries were originally introduced in Consul 0.6.0, and ACL behavior remained
-unchanged through version 0.6.3, but was then changed to allow better management of the
-prepared query namespace.
-
-These differences are outlined in the table below:
-
-<table class="table table-bordered table-striped">
-  <tr>
-    <th>Operation</th>
-    <th>Version <= 0.6.3 </th>
-    <th>Version > 0.6.3 </th>
-  </tr>
-  <tr>
-    <td>Create static query without `Name`</td>
-    <td>The ACL Token used to create the prepared query is checked to make sure it can access the service being queried. This token is captured as the `Token` to use when executing the prepared query.</td>
-    <td>No ACL policies are used as long as no `Name` is defined. No `Token` is captured by default unless specifically supplied by the client when creating the query.</td>
-  </tr>
-  <tr>
-    <td>Create static query with `Name`</td>
-    <td>The ACL Token used to create the prepared query is checked to make sure it can access the service being queried. This token is captured as the `Token` to use when executing the prepared query.</td>
-    <td>The client token's `query` ACL policy is used to determine if the client is allowed to register a query for the given `Name`. No `Token` is captured by default unless specifically supplied by the client when creating the query.</td>
-  </tr>
-  <tr>
-    <td>Manage static query without `Name`</td>
-    <td>The ACL Token used to create the query, or a management token must be supplied in order to perform these operations.</td>
-    <td>Any client with the ID of the query can perform these operations.</td>
-  </tr>
-  <tr>
-    <td>Manage static query with a `Name`</td>
-    <td>The ACL token used to create the query, or a management token must be supplied in order to perform these operations.</td>
-    <td>Similar to create, the client token's `query` ACL policy is used to determine if these operations are allowed.</td>
-  </tr>
-  <tr>
-    <td>List queries</td>
-    <td>A management token is required to list any queries.</td>
-    <td>The client token's `query` ACL policy is used to determine which queries they can see. Only management tokens can see prepared queries without `Name`.</td>
-  </tr>
-  <tr>
-    <td>Execute query</td>
-    <td>Since a `Token` is always captured when a query is created, that is used to check access to the service being queried. Any token supplied by the client is ignored.</td>
-    <td>The captured token, client's token, or anonymous token is used to filter the results, as described above.</td>
-  </tr>
-</table>
-
-#### Service Rules
-
-The `service` policy controls service-level registration and read access to the [Catalog API](/api/catalog.html)
-and service discovery with the [Health API](/api/health.html).
-
-Service rules look like this:
-
-```text
-service "" {
-  policy = "read"
-}
-service "app" {
-  policy = "write"
-}
-service "admin" {
-  policy = "deny"
-}
+```
+$ consul members
 ```
 
-Service rules are keyed by the service name prefix they apply to, using the longest prefix match rule. In
-the example above, the rules allow read-only access to any service name with the empty prefix, allow
-read-write access to any service name that starts with "app", and deny all access to any service name that
-starts with "admin".
+We will not receive an error, since the ACL has filtered what we see and we are not allowed to
+see any nodes by default.
 
-Consul's DNS interface is affected by restrictions on service rules. If the
-[`acl_token`](/docs/agent/options.html#acl_token) used by the agent does not have "read" access to a
-given service, then the DNS interface will return no records when queried for it.
+If we supply the token we created above we will be able to see a listing of nodes because
+it has write privileges to an empty `node` prefix, meaning it has access to all nodes:
 
-When reading from the catalog or retrieving information from the health endpoints, service rules are
-used to filter the results of the query.
-
-Service rules come into play when using the [Agent API](/api/agent.html) to register services or
-checks. The agent will check tokens locally as a service or check is registered, and Consul also
-performs periodic [anti-entropy](/docs/internals/anti-entropy.html) syncs, which may require an
-ACL token to complete. To accommodate this, Consul provides two methods of configuring ACL tokens
-to use for registration events:
-
-1. Using the [acl_token](/docs/agent/options.html#acl_token) configuration
-   directive. This allows a single token to be configured globally and used
-   during all service and check registration operations.
-2. Providing an ACL token with service and check definitions at
-   registration time. This allows for greater flexibility and enables the use
-   of multiple tokens on the same agent. Examples of what this looks like are
-   available for both [services](/docs/agent/services.html) and
-   [checks](/docs/agent/checks.html). Tokens may also be passed to the
-   [HTTP API](/api/index.html) for operations that require them.
-
-#### Session Rules
-
-The `session` policy controls access to [Session API](/api/session.html) operations.
-
-Session rules look like this:
-
-```text
-session "" {
-  policy = "read"
-}
-session "app" {
-  policy = "write"
-}
-session "admin" {
-  policy = "deny"
-}
+```bash
+$ CONSUL_HTTP_TOKEN=4411f091-a4c9-48e6-0884-1fcb092da1c8 consul members
+Node  Address            Status  Type    Build  Protocol  DC   Segment
+fox   172.20.20.10:8301  alive   server  1.4.0  2         kc  <all>
+bear  172.20.20.11:8301  alive   server  1.4.0  2         kc  <all>
+wolf  172.20.20.12:8301  alive   server  1.4.0  2         kc  <all>
 ```
 
-Session rules are keyed by the node name prefix they apply to, using the longest prefix match rule. In
-the example above, the rules allow read-only access to sessions on node name with the empty prefix, allow
-creating sessions on any node name that starts with "app", and deny all access to any sessions on a node
-name that starts with "admin".
+It is common in many environments to allow listing of all nodes, even without a
+token. The policies associated with the special anonymous token can be updated to
+configure Consul's behavior when no token is supplied. The anonymous token is managed
+like any other ACL token, except that `anonymous` is used for the ID. In this example
+we will give the anonymous token read privileges for all nodes:
 
-## Advanced Topics
+```bash
+$ consul acl policy create -name 'list-all-nodes' -rules 'node_prefix "" { policy = "read" }'
+ID:           e96d0a33-28b4-d0dd-9b3f-08301700ac72
+Name:         list-all-nodes
+Description:
+Datacenters:
+Rules:
+node_prefix "" { policy = "read" }
 
-<a name="replication"></a>
-#### Outages and ACL Replication
+$ consul acl token update -id 00000000-0000-0000-0000-000000000002 -policy-name list-all-nodes -description "Anonymous Token - Can List Nodes"
+Token updated successfully.
+AccessorID:   00000000-0000-0000-0000-000000000002
+SecretID:     anonymous
+Description:  Anonymous Token - Can List Nodes
+Local:        false
+Create Time:  0001-01-01 00:00:00 +0000 UTC
+Hash:         ee4638968d9061647ac8c3c99e9d37bfdd2af4d1eaa07a7b5f80af0389460948
+Create Index: 5
+Modify Index: 38
+Policies:
+   e96d0a33-28b4-d0dd-9b3f-08301700ac72 - list-all-nodes
 
-The Consul ACL system is designed with flexible rules to accommodate for an outage
-of the [`acl_datacenter`](/docs/agent/options.html#acl_datacenter) or networking
-issues preventing access to it. In this case, it may be impossible for
-agents in non-authoritative datacenters to resolve tokens. Consul provides
-a number of configurable [`acl_down_policy`](/docs/agent/options.html#acl_down_policy)
-choices to tune behavior. It is possible to deny or permit all actions or to ignore
-cache TTLs and enter a fail-safe mode. The default is to ignore cache TTLs
-for any previously resolved tokens and to deny any uncached tokens.
+```
 
-Consul 0.7 added an ACL Replication capability that can allow non-authoritative
-datacenter agents to resolve even uncached tokens. This is enabled by setting an
-[`acl_replication_token`](/docs/agent/options.html#acl_replication_token) in the
-configuration on the servers in the non-authoritative datacenters. With replication
-enabled, the servers will maintain a replica of the authoritative datacenter's full
-set of ACLs on the non-authoritative servers. The ACL replication token needs to be
-a valid ACL token with management privileges, it can also be the same as the master
-ACL token.
+The anonymous token is implicitly used if no token is supplied, so now we can run
+`consul members` without supplying a token and we will be able to see the nodes:
 
-Replication occurs with a background process that looks for new ACLs approximately
-every 30 seconds. Replicated changes are written at a rate that's throttled to
-100 updates/second, so it may take several minutes to perform the initial sync of
-a large set of ACLs.
+```bash
+$ consul members
+Node  Address            Status  Type    Build  Protocol  DC   Segment
+fox   172.20.20.10:8301  alive   server  1.4.0  2         kc  <all>
+bear  172.20.20.11:8301  alive   server  1.4.0  2         kc  <all>
+wolf  172.20.20.12:8301  alive   server  1.4.0  2         kc  <all>
+```
 
-If there's a partition or other outage affecting the authoritative datacenter,
-and the [`acl_down_policy`](/docs/agent/options.html#acl_down_policy)
-is set to "extend-cache", tokens will be resolved during the outage using the
-replicated set of ACLs. An [ACL replication status](/api/acl.html#acl_replication_status)
-endpoint is available to monitor the health of the replication process.
+The anonymous token is also used for DNS lookups since there is no way to pass a
+token as part of a DNS request. Here's an example lookup for the "consul" service:
 
-Locally-resolved ACLs will be cached using the [`acl_ttl`](/docs/agent/options.html#acl_ttl)
-setting of the non-authoritative datacenter, so these entries may persist in the
-cache for up to the TTL, even after the authoritative datacenter comes back online.
+```
+$ dig @127.0.0.1 -p 8600 consul.service.consul
 
-ACL replication can also be used to migrate ACLs from one datacenter to another
-using a process like this:
+; <<>> DiG 9.8.3-P1 <<>> @127.0.0.1 -p 8600 consul.service.consul
+; (1 server found)
+;; global options: +cmd
+;; Got answer:
+;; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 9648
+;; flags: qr aa rd; QUERY: 1, ANSWER: 0, AUTHORITY: 1, ADDITIONAL: 0
+;; WARNING: recursion requested but not available
 
-1. Enable ACL replication in all datacenters to allow continuation of service
-during the migration, and to populate the target datacenter. Verify replication
-is healthy and caught up to the current ACL index in the target datacenter
-using the [ACL replication status](/api/acl.html#acl_replication_status)
-endpoint.
-2. Turn down the old authoritative datacenter servers.
-3. Rolling restart the agents in the target datacenter and change the
-`acl_datacenter` servers to itself. This will automatically turn off
-replication and will enable the datacenter to start acting as the authoritative
-datacenter, using its replicated ACLs from before.
-3. Rolling restart the agents in other datacenters and change their `acl_datacenter`
-configuration to the target datacenter.
+;; QUESTION SECTION:
+;consul.service.consul.         IN      A
 
-<a name="version_8_acls"></a>
-#### Complete ACL Coverage in Consul 0.8
+;; AUTHORITY SECTION:
+consul.                 0       IN      SOA     ns.consul. postmaster.consul. 1499584110 3600 600 86400 0
+```
 
-Consul 0.8 added many more ACL policy types and brought ACL enforcement to Consul
-agents for the first time. To ease the transition to Consul 0.8 for existing ACL
-users, there's a configuration option to disable these new features. To disable
-support for these new ACLs, set the
-[`acl_enforce_version_8`](/docs/agent/options.html#acl_enforce_version_8) configuration
-option to `false` on Consul clients and servers.
+Now we get an `NXDOMAIN` error because the anonymous token doesn't have access to the
+"consul" service. Let's update the anonymous token's policy to allow for service reads of the "consul" service.
 
-Here's a summary of the new features:
+```bash
+$ consul acl policy create -name 'service-consul-read' -rules 'service "consul" { policy = "read" }'
+ID:           3c93f536-5748-2163-bb66-088d517273ba
+Name:         service-consul-read
+Description:
+Datacenters:
+Rules:
+service "consul" { policy = "read" }
 
-* Agents now check [`node`](#node-rules) and [`service`](#service-rules) ACL policies
-  for catalog-related operations in `/v1/agent` endpoints, such as service and check
-  registration and health check updates.
-* Agents enforce a new [`agent`](#agent-rules) ACL policy for utility operations in
-  `/v1/agent` endpoints, such as joins and leaves.
-* A new [`node`](#node-rules) ACL policy is enforced throughout Consul, providing a
-  mechanism to restrict registration and discovery of nodes by name. This also applies
-  to service discovery, so provides an additional dimension for controlling access to
-  services.
-* A new [`session`](#session-rules) ACL policy controls the ability to create session
-  objects by node name.
-* Anonymous prepared queries (non-templates without a `Name`) now require a valid
-  session, which ties their creation to the new [`session`](#session-rules) ACL policy.
-* The existing [`event`](#event-rules) ACL policy has been applied to the
-  `/v1/event/list` endpoint.
+$ consul acl token update -id 00000000-0000-0000-0000-000000000002 --merge-policies -description "Anonymous Token - Can List Nodes" -policy-name service-consul-read
+Token updated successfully.
+AccessorID:   00000000-0000-0000-0000-000000000002
+SecretID:     anonymous
+Description:  Anonymous Token - Can List Nodes
+Local:        false
+Create Time:  0001-01-01 00:00:00 +0000 UTC
+Hash:         2c641c4f73158ef6d62f6467c68d751fccd4db9df99b235373e25934f9bbd939
+Create Index: 5
+Modify Index: 43
+Policies:
+   e96d0a33-28b4-d0dd-9b3f-08301700ac72 - list-all-nodes
+   3c93f536-5748-2163-bb66-088d517273ba - service-consul-read
+```
 
-Two new configuration options are used once version 8 ACLs are enabled:
+With that new policy in place, the DNS lookup will succeed:
 
-* [`acl_agent_master_token`](/docs/agent/options.html#acl_agent_master_token) is used as
-  a special access token that has `agent` ACL policy `write` privileges on each agent where
-  it is configured. This token should only be used by operators during outages when Consul
-  servers aren't available to resolve ACL tokens. Applications should use regular ACL
-  tokens during normal operation.
-* [`acl_agent_token`](/docs/agent/options.html#acl_agent_token) is used internally by
-  Consul agents to perform operations to the service catalog when registering themselves
-  or sending network coordinates to the servers. This token must at least have `node` ACL
-  policy `write` access to the node name it will register as in order to register any
-  node-level information like metadata or tagged addresses.
+```
+$ dig @127.0.0.1 -p 8600 consul.service.consul
 
-Since clients now resolve ACLs locally, the [`acl_down_policy`](/docs/agent/options.html#acl_down_policy)
-now applies to Consul clients as well as Consul servers. This will determine what the
-client will do in the event that the servers are down.
+; <<>> DiG 9.8.3-P1 <<>> @127.0.0.1 -p 8600 consul.service.consul
+; (1 server found)
+;; global options: +cmd
+;; Got answer:
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 46006
+;; flags: qr aa rd; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0
+;; WARNING: recursion requested but not available
 
-Consul clients must have [`acl_datacenter`](/docs/agent/options.html#acl_datacenter) configured
-in order to enable agent-level ACL features. If this is set, the agents will contact the Consul
-servers to determine if ACLs are enabled at the cluster level. If they detect that ACLs are not
-enabled, they will check at most every 2 minutes to see if they have become enabled, and will
-start enforcing ACLs automatically. If an agent has an `acl_datacenter` defined, operators will
-need to use the [`acl_agent_master_token`](/docs/agent/options.html#acl_agent_master_token) to
-perform agent-level operations if the Consul servers aren't present (such as for a manual join
-to the cluster), unless the [`acl_down_policy`](/docs/agent/options.html#acl_down_policy) on the
-agent is set to "allow".
+;; QUESTION SECTION:
+;consul.service.consul.         IN      A
 
-Non-server agents do not need to have the
-[`acl_master_token`](/docs/agent/options.html#acl_master_token) configured; it is not
-used by agents in any way.
+;; ANSWER SECTION:
+consul.service.consul.  0       IN      A       127.0.0.1
+```
+
+The next section shows an alternative to the anonymous token.
+
+#### Set Agent-Specific Default Tokens (Optional)
+
+An alternative to the anonymous token is the [`acl.tokens.default`](/docs/agent/options.html#acl_tokens_default)
+configuration item. When a request is made to a particular Consul agent and no token is
+supplied, the [`acl.tokens.default`](/docs/agent/options.html#acl_tokens_default) will be used for the token, instead of being left empty which would normally invoke the anonymous token.
+
+This behaves very similarly to the anonymous token, but can be configured differently on each
+agent, if desired. For example, this allows more fine grained control of what DNS requests a
+given agent can service or can give the agent read access to some key-value store prefixes by
+default.
+
+If using [`acl.tokens.default`](/docs/agent/options.html#acl_tokens_default), then it's likely the anonymous token will have a more restrictive policy than shown in these examples.
+
+#### Create Tokens for UI Use (Optional)
+
+If you utilize the Consul UI with a restrictive ACL policy, as above, the UI will not function fully using the anonymous ACL token. It is recommended that a UI-specific ACL token is used, which can be set in the UI during the web browser session to authenticate the interface.
+
+First create the new policy.
+
+```bash
+$ consul acl policy create -name "ui-policy" \
+                           -description "Necessary permissions for UI functionality" \
+                           -rules 'key_prefix "" { policy = "write" } node_prefix "" { policy = "read" } service_prefix "" { policy = "read" }'
+ID:           9cb99b2b-3c20-81d4-a7c0-9ffdc2fbf08a
+Name:         ui-policy
+Description:  Necessary permissions for UI functionality
+Datacenters:
+Rules:
+key_prefix "" { policy = "write" } node_prefix "" { policy = "read" } service_prefix "" { policy = "read" }
+```
+
+With the new policy, create a token.
+
+```sh
+$ consul acl token create -description "UI Token" -policy-name "ui-policy"
+AccessorID:   56e605cf-a6f9-5f9d-5c08-a0e1323cf016
+SecretID:     117842b6-6208-446a-0d1e-daf93854857d
+Description:  UI Token
+Local:        false
+Create Time:  2018-10-19 14:55:44.254063 -0400 EDT
+Policies:
+   9cb99b2b-3c20-81d4-a7c0-9ffdc2fbf08a - ui-policy
+```
+
+The token can then be set on the "settings" page of the UI.
+
+Note, in this example, we have also given full write access to the KV through the UI.
+
+## Summary
+
+The [ACL API](/api/acl/acl.html) can be used to create tokens for applications specific to their intended use and to create more specific ACL agent tokens for each agent's expected role. 
+Now that you have bootstrapped ACLs, learn more about [ACL rules](/docs/agent/acl-rules.html)
+
+### Notes on Security 
+
+In this guide we configured a basic ACL environment with the ability to see all nodes
+by default, but with limited access to discover only the "consul" service. If your environment has stricter security requirements we would like to note the following and make some additional recommendations. 
+
+1. In this guide we added the agent token to the configuration file. This means the tokens are now saved on disk. If this is a security concern, tokens can be added to agents using the [Consul CLI](https://www.consul.io/docs/commands/acl/acl-set-agent-token.html). However, this process is more complicated and takes additional care. 
+
+2. It is recommended that each client get an ACL agent token with `node` write privileges for just its own node name, and `service` read privileges for just the service prefixes expected to be registered on that client.
+
+3. [Anti-entropy](/docs/internals/anti-entropy.html) syncing requires the ACL agent token
+to have `service:write` privileges for all services that may be registered with the agent.
+We recommend providing `service:write` for each separate service via a separate token that 
+is used when registering via the API, or provided along with the [registration in the 
+configuration file](https://www.consul.io/docs/agent/services.html). Note that `service:write`
+is the privilege required to assume the identity of a service and so Consul Connect's
+intentions are only enforceable to the extent that each service instance is unable to gain 
+`service:write` on any other service name. For more details see the Connect security
+[documentation](https://www.consul.io/docs/connect/security.html).
+
+

@@ -2,10 +2,12 @@ package consul
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/armon/go-metrics"
 	"github.com/hashicorp/consul/agent/consul/state"
-	"github.com/hashicorp/consul/agent/consul/structs"
+	"github.com/hashicorp/consul/agent/structs"
+	bexpr "github.com/hashicorp/go-bexpr"
 	"github.com/hashicorp/go-memdb"
 )
 
@@ -18,6 +20,11 @@ type Health struct {
 func (h *Health) ChecksInState(args *structs.ChecksInStateRequest,
 	reply *structs.IndexedHealthChecks) error {
 	if done, err := h.srv.forward("Health.ChecksInState", args, args, reply); done {
+		return err
+	}
+
+	filter, err := bexpr.CreateFilter(args.Filter, nil, reply.HealthChecks)
+	if err != nil {
 		return err
 	}
 
@@ -40,6 +47,13 @@ func (h *Health) ChecksInState(args *structs.ChecksInStateRequest,
 			if err := h.srv.filterACL(args.Token, reply); err != nil {
 				return err
 			}
+
+			raw, err := filter.Execute(reply.HealthChecks)
+			if err != nil {
+				return err
+			}
+			reply.HealthChecks = raw.(structs.HealthChecks)
+
 			return h.srv.sortNodesByDistanceFrom(args.Source, reply.HealthChecks)
 		})
 }
@@ -48,6 +62,11 @@ func (h *Health) ChecksInState(args *structs.ChecksInStateRequest,
 func (h *Health) NodeChecks(args *structs.NodeSpecificRequest,
 	reply *structs.IndexedHealthChecks) error {
 	if done, err := h.srv.forward("Health.NodeChecks", args, args, reply); done {
+		return err
+	}
+
+	filter, err := bexpr.CreateFilter(args.Filter, nil, reply.HealthChecks)
+	if err != nil {
 		return err
 	}
 
@@ -60,7 +79,16 @@ func (h *Health) NodeChecks(args *structs.NodeSpecificRequest,
 				return err
 			}
 			reply.Index, reply.HealthChecks = index, checks
-			return h.srv.filterACL(args.Token, reply)
+			if err := h.srv.filterACL(args.Token, reply); err != nil {
+				return err
+			}
+
+			raw, err := filter.Execute(reply.HealthChecks)
+			if err != nil {
+				return err
+			}
+			reply.HealthChecks = raw.(structs.HealthChecks)
+			return nil
 		})
 }
 
@@ -74,6 +102,11 @@ func (h *Health) ServiceChecks(args *structs.ServiceSpecificRequest,
 
 	// Potentially forward
 	if done, err := h.srv.forward("Health.ServiceChecks", args, args, reply); done {
+		return err
+	}
+
+	filter, err := bexpr.CreateFilter(args.Filter, nil, reply.HealthChecks)
+	if err != nil {
 		return err
 	}
 
@@ -96,6 +129,13 @@ func (h *Health) ServiceChecks(args *structs.ServiceSpecificRequest,
 			if err := h.srv.filterACL(args.Token, reply); err != nil {
 				return err
 			}
+
+			raw, err := filter.Execute(reply.HealthChecks)
+			if err != nil {
+				return err
+			}
+			reply.HealthChecks = raw.(structs.HealthChecks)
+
 			return h.srv.sortNodesByDistanceFrom(args.Source, reply.HealthChecks)
 		})
 }
@@ -111,18 +151,42 @@ func (h *Health) ServiceNodes(args *structs.ServiceSpecificRequest, reply *struc
 		return fmt.Errorf("Must provide service name")
 	}
 
-	err := h.srv.blockingQuery(
+	// Determine the function we'll call
+	var f func(memdb.WatchSet, *state.Store, *structs.ServiceSpecificRequest) (uint64, structs.CheckServiceNodes, error)
+	switch {
+	case args.Connect:
+		f = h.serviceNodesConnect
+	case args.TagFilter:
+		f = h.serviceNodesTagFilter
+	default:
+		f = h.serviceNodesDefault
+	}
+
+	// If we're doing a connect query, we need read access to the service
+	// we're trying to find proxies for, so check that.
+	if args.Connect {
+		// Fetch the ACL token, if any.
+		rule, err := h.srv.ResolveToken(args.Token)
+		if err != nil {
+			return err
+		}
+
+		if rule != nil && !rule.ServiceRead(args.ServiceName) {
+			// Just return nil, which will return an empty response (tested)
+			return nil
+		}
+	}
+
+	filter, err := bexpr.CreateFilter(args.Filter, nil, reply.Nodes)
+	if err != nil {
+		return err
+	}
+
+	err = h.srv.blockingQuery(
 		&args.QueryOptions,
 		&reply.QueryMeta,
 		func(ws memdb.WatchSet, state *state.Store) error {
-			var index uint64
-			var nodes structs.CheckServiceNodes
-			var err error
-			if args.TagFilter {
-				index, nodes, err = state.CheckServiceTagNodes(ws, args.ServiceName, args.ServiceTag)
-			} else {
-				index, nodes, err = state.CheckServiceNodes(ws, args.ServiceName)
-			}
+			index, nodes, err := f(ws, state, args)
 			if err != nil {
 				return err
 			}
@@ -131,21 +195,73 @@ func (h *Health) ServiceNodes(args *structs.ServiceSpecificRequest, reply *struc
 			if len(args.NodeMetaFilters) > 0 {
 				reply.Nodes = nodeMetaFilter(args.NodeMetaFilters, reply.Nodes)
 			}
+
 			if err := h.srv.filterACL(args.Token, reply); err != nil {
 				return err
 			}
+
+			raw, err := filter.Execute(reply.Nodes)
+			if err != nil {
+				return err
+			}
+			reply.Nodes = raw.(structs.CheckServiceNodes)
+
 			return h.srv.sortNodesByDistanceFrom(args.Source, reply.Nodes)
 		})
 
 	// Provide some metrics
 	if err == nil {
-		metrics.IncrCounter([]string{"consul", "health", "service", "query", args.ServiceName}, 1)
+		// For metrics, we separate Connect-based lookups from non-Connect
+		key := "service"
+		if args.Connect {
+			key = "connect"
+		}
+
+		metrics.IncrCounterWithLabels([]string{"health", key, "query"}, 1,
+			[]metrics.Label{{Name: "service", Value: args.ServiceName}})
+		// DEPRECATED (singular-service-tag) - remove this when backwards RPC compat
+		// with 1.2.x is not required.
 		if args.ServiceTag != "" {
-			metrics.IncrCounter([]string{"consul", "health", "service", "query-tag", args.ServiceName, args.ServiceTag}, 1)
+			metrics.IncrCounterWithLabels([]string{"health", key, "query-tag"}, 1,
+				[]metrics.Label{{Name: "service", Value: args.ServiceName}, {Name: "tag", Value: args.ServiceTag}})
+		}
+		if len(args.ServiceTags) > 0 {
+			// Sort tags so that the metric is the same even if the request
+			// tags are in a different order
+			sort.Strings(args.ServiceTags)
+
+			labels := []metrics.Label{{Name: "service", Value: args.ServiceName}}
+			for _, tag := range args.ServiceTags {
+				labels = append(labels, metrics.Label{Name: "tag", Value: tag})
+			}
+			metrics.IncrCounterWithLabels([]string{"health", key, "query-tags"}, 1, labels)
 		}
 		if len(reply.Nodes) == 0 {
-			metrics.IncrCounter([]string{"consul", "health", "service", "not-found", args.ServiceName}, 1)
+			metrics.IncrCounterWithLabels([]string{"health", key, "not-found"}, 1,
+				[]metrics.Label{{Name: "service", Value: args.ServiceName}})
 		}
 	}
 	return err
+}
+
+// The serviceNodes* functions below are the various lookup methods that
+// can be used by the ServiceNodes endpoint.
+
+func (h *Health) serviceNodesConnect(ws memdb.WatchSet, s *state.Store, args *structs.ServiceSpecificRequest) (uint64, structs.CheckServiceNodes, error) {
+	return s.CheckConnectServiceNodes(ws, args.ServiceName)
+}
+
+func (h *Health) serviceNodesTagFilter(ws memdb.WatchSet, s *state.Store, args *structs.ServiceSpecificRequest) (uint64, structs.CheckServiceNodes, error) {
+	// DEPRECATED (singular-service-tag) - remove this when backwards RPC compat
+	// with 1.2.x is not required.
+	// Agents < v1.3.0 populate the ServiceTag field. In this case,
+	// use ServiceTag instead of the ServiceTags field.
+	if args.ServiceTag != "" {
+		return s.CheckServiceTagNodes(ws, args.ServiceName, []string{args.ServiceTag})
+	}
+	return s.CheckServiceTagNodes(ws, args.ServiceName, args.ServiceTags)
+}
+
+func (h *Health) serviceNodesDefault(ws memdb.WatchSet, s *state.Store, args *structs.ServiceSpecificRequest) (uint64, structs.CheckServiceNodes, error) {
+	return s.CheckServiceNodes(ws, args.ServiceName)
 }

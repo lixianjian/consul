@@ -3,24 +3,28 @@ package consul
 import (
 	"fmt"
 	"os"
-	"reflect"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/hashicorp/consul/agent/consul/structs"
+	"github.com/hashicorp/consul/acl"
+	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/sdk/freeport"
 	"github.com/hashicorp/consul/testrpc"
 	"github.com/hashicorp/net-rpc-msgpackrpc"
 	"github.com/hashicorp/raft"
+	"github.com/pascaldekloe/goe/verify"
 )
 
 func TestOperator_RaftGetConfiguration(t *testing.T) {
+	t.Parallel()
 	dir1, s1 := testServer(t)
 	defer os.RemoveAll(dir1)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
 	defer codec.Close()
 
-	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+	testrpc.WaitForTestAgent(t, s1.RPC, "dc1")
 
 	arg := structs.DCSpecificRequest{
 		Datacenter: "dc1",
@@ -41,23 +45,24 @@ func TestOperator_RaftGetConfiguration(t *testing.T) {
 	expected := structs.RaftConfigurationResponse{
 		Servers: []*structs.RaftServer{
 			&structs.RaftServer{
-				ID:      me.ID,
-				Node:    s1.config.NodeName,
-				Address: me.Address,
-				Leader:  true,
-				Voter:   true,
+				ID:              me.ID,
+				Node:            s1.config.NodeName,
+				Address:         me.Address,
+				Leader:          true,
+				Voter:           true,
+				ProtocolVersion: "3",
 			},
 		},
 		Index: future.Index(),
 	}
-	if !reflect.DeepEqual(reply, expected) {
-		t.Fatalf("bad: %v", reply)
-	}
+	verify.Values(t, "", reply, expected)
 }
 
 func TestOperator_RaftGetConfiguration_ACLDeny(t *testing.T) {
+	t.Parallel()
 	dir1, s1 := testServerWithConfig(t, func(c *Config) {
 		c.ACLDatacenter = "dc1"
+		c.ACLsEnabled = true
 		c.ACLMasterToken = "root"
 		c.ACLDefaultPolicy = "deny"
 	})
@@ -66,7 +71,7 @@ func TestOperator_RaftGetConfiguration_ACLDeny(t *testing.T) {
 	codec := rpcClient(t, s1)
 	defer codec.Close()
 
-	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+	testrpc.WaitForTestAgent(t, s1.RPC, "dc1")
 
 	// Make a request with no token to make sure it gets denied.
 	arg := structs.DCSpecificRequest{
@@ -74,7 +79,7 @@ func TestOperator_RaftGetConfiguration_ACLDeny(t *testing.T) {
 	}
 	var reply structs.RaftConfigurationResponse
 	err := msgpackrpc.CallWithCodec(codec, "Operator.RaftGetConfiguration", &arg, &reply)
-	if err == nil || !strings.Contains(err.Error(), permissionDenied) {
+	if !acl.IsErrPermissionDenied(err) {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -90,7 +95,7 @@ func TestOperator_RaftGetConfiguration_ACLDeny(t *testing.T) {
 			Op:         structs.ACLSet,
 			ACL: structs.ACL{
 				Name:  "User token",
-				Type:  structs.ACLTypeClient,
+				Type:  structs.ACLTokenTypeClient,
 				Rules: rules,
 			},
 			WriteRequest: structs.WriteRequest{Token: "root"},
@@ -117,21 +122,21 @@ func TestOperator_RaftGetConfiguration_ACLDeny(t *testing.T) {
 	expected := structs.RaftConfigurationResponse{
 		Servers: []*structs.RaftServer{
 			&structs.RaftServer{
-				ID:      me.ID,
-				Node:    s1.config.NodeName,
-				Address: me.Address,
-				Leader:  true,
-				Voter:   true,
+				ID:              me.ID,
+				Node:            s1.config.NodeName,
+				Address:         me.Address,
+				Leader:          true,
+				Voter:           true,
+				ProtocolVersion: "3",
 			},
 		},
 		Index: future.Index(),
 	}
-	if !reflect.DeepEqual(reply, expected) {
-		t.Fatalf("bad: %v", reply)
-	}
+	verify.Values(t, "", reply, expected)
 }
 
 func TestOperator_RaftRemovePeerByAddress(t *testing.T) {
+	t.Parallel()
 	dir1, s1 := testServer(t)
 	defer os.RemoveAll(dir1)
 	defer s1.Shutdown()
@@ -143,7 +148,7 @@ func TestOperator_RaftRemovePeerByAddress(t *testing.T) {
 	// Try to remove a peer that's not there.
 	arg := structs.RaftRemovePeerRequest{
 		Datacenter: "dc1",
-		Address:    raft.ServerAddress(fmt.Sprintf("127.0.0.1:%d", getPort())),
+		Address:    raft.ServerAddress(fmt.Sprintf("127.0.0.1:%d", freeport.Get(1)[0])),
 	}
 	var reply struct{}
 	err := msgpackrpc.CallWithCodec(codec, "Operator.RaftRemovePeerByAddress", &arg, &reply)
@@ -153,7 +158,8 @@ func TestOperator_RaftRemovePeerByAddress(t *testing.T) {
 
 	// Add it manually to Raft.
 	{
-		future := s1.raft.AddPeer(arg.Address)
+		id := raft.ServerID("fake-node-id")
+		future := s1.raft.AddVoter(id, arg.Address, 0, time.Second)
 		if err := future.Error(); err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -190,8 +196,10 @@ func TestOperator_RaftRemovePeerByAddress(t *testing.T) {
 }
 
 func TestOperator_RaftRemovePeerByAddress_ACLDeny(t *testing.T) {
+	t.Parallel()
 	dir1, s1 := testServerWithConfig(t, func(c *Config) {
 		c.ACLDatacenter = "dc1"
+		c.ACLsEnabled = true
 		c.ACLMasterToken = "root"
 		c.ACLDefaultPolicy = "deny"
 	})
@@ -200,7 +208,7 @@ func TestOperator_RaftRemovePeerByAddress_ACLDeny(t *testing.T) {
 	codec := rpcClient(t, s1)
 	defer codec.Close()
 
-	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+	testrpc.WaitForTestAgent(t, s1.RPC, "dc1")
 
 	// Make a request with no token to make sure it gets denied.
 	arg := structs.RaftRemovePeerRequest{
@@ -209,7 +217,7 @@ func TestOperator_RaftRemovePeerByAddress_ACLDeny(t *testing.T) {
 	}
 	var reply struct{}
 	err := msgpackrpc.CallWithCodec(codec, "Operator.RaftRemovePeerByAddress", &arg, &reply)
-	if err == nil || !strings.Contains(err.Error(), permissionDenied) {
+	if !acl.IsErrPermissionDenied(err) {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -225,7 +233,7 @@ func TestOperator_RaftRemovePeerByAddress_ACLDeny(t *testing.T) {
 			Op:         structs.ACLSet,
 			ACL: structs.ACL{
 				Name:  "User token",
-				Type:  structs.ACLTypeClient,
+				Type:  structs.ACLTokenTypeClient,
 				Rules: rules,
 			},
 			WriteRequest: structs.WriteRequest{Token: "root"},
@@ -245,6 +253,7 @@ func TestOperator_RaftRemovePeerByAddress_ACLDeny(t *testing.T) {
 }
 
 func TestOperator_RaftRemovePeerByID(t *testing.T) {
+	t.Parallel()
 	dir1, s1 := testServerWithConfig(t, func(c *Config) {
 		c.RaftConfig.ProtocolVersion = 3
 	})
@@ -268,7 +277,7 @@ func TestOperator_RaftRemovePeerByID(t *testing.T) {
 
 	// Add it manually to Raft.
 	{
-		future := s1.raft.AddVoter(arg.ID, raft.ServerAddress(fmt.Sprintf("127.0.0.1:%d", getPort())), 0, 0)
+		future := s1.raft.AddVoter(arg.ID, raft.ServerAddress(fmt.Sprintf("127.0.0.1:%d", freeport.Get(1)[0])), 0, 0)
 		if err := future.Error(); err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -305,8 +314,10 @@ func TestOperator_RaftRemovePeerByID(t *testing.T) {
 }
 
 func TestOperator_RaftRemovePeerByID_ACLDeny(t *testing.T) {
+	t.Parallel()
 	dir1, s1 := testServerWithConfig(t, func(c *Config) {
 		c.ACLDatacenter = "dc1"
+		c.ACLsEnabled = true
 		c.ACLMasterToken = "root"
 		c.ACLDefaultPolicy = "deny"
 		c.RaftConfig.ProtocolVersion = 3
@@ -325,7 +336,7 @@ func TestOperator_RaftRemovePeerByID_ACLDeny(t *testing.T) {
 	}
 	var reply struct{}
 	err := msgpackrpc.CallWithCodec(codec, "Operator.RaftRemovePeerByID", &arg, &reply)
-	if err == nil || !strings.Contains(err.Error(), permissionDenied) {
+	if !acl.IsErrPermissionDenied(err) {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -341,7 +352,7 @@ func TestOperator_RaftRemovePeerByID_ACLDeny(t *testing.T) {
 			Op:         structs.ACLSet,
 			ACL: structs.ACL{
 				Name:  "User token",
-				Type:  structs.ACLTypeClient,
+				Type:  structs.ACLTokenTypeClient,
 				Rules: rules,
 			},
 			WriteRequest: structs.WriteRequest{Token: "root"},

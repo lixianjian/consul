@@ -8,13 +8,14 @@ import (
 	"time"
 )
 
-func TestClientPutGetDelete(t *testing.T) {
+func TestAPI_ClientPutGetDelete(t *testing.T) {
 	t.Parallel()
 	c, s := makeClient(t)
 	defer s.Stop()
 
 	kv := c.KV()
 
+	s.WaitForSerfCheck(t)
 	// Get a get without a key
 	key := testKey()
 	pair, _, err := kv.Get(key, nil)
@@ -73,7 +74,7 @@ func TestClientPutGetDelete(t *testing.T) {
 	}
 }
 
-func TestClient_List_DeleteRecurse(t *testing.T) {
+func TestAPI_ClientList_DeleteRecurse(t *testing.T) {
 	t.Parallel()
 	c, s := makeClient(t)
 	defer s.Stop()
@@ -128,7 +129,7 @@ func TestClient_List_DeleteRecurse(t *testing.T) {
 	}
 }
 
-func TestClient_DeleteCAS(t *testing.T) {
+func TestAPI_ClientDeleteCAS(t *testing.T) {
 	t.Parallel()
 	c, s := makeClient(t)
 	defer s.Stop()
@@ -174,7 +175,7 @@ func TestClient_DeleteCAS(t *testing.T) {
 	}
 }
 
-func TestClient_CAS(t *testing.T) {
+func TestAPI_ClientCAS(t *testing.T) {
 	t.Parallel()
 	c, s := makeClient(t)
 	defer s.Stop()
@@ -222,13 +223,14 @@ func TestClient_CAS(t *testing.T) {
 	}
 }
 
-func TestClient_WatchGet(t *testing.T) {
+func TestAPI_ClientWatchGet(t *testing.T) {
 	t.Parallel()
 	c, s := makeClient(t)
 	defer s.Stop()
 
 	kv := c.KV()
 
+	s.WaitForSerfCheck(t)
 	// Get a get without a key
 	key := testKey()
 	pair, meta, err := kv.Get(key, nil)
@@ -279,7 +281,7 @@ func TestClient_WatchGet(t *testing.T) {
 	<-doneCh
 }
 
-func TestClient_WatchList(t *testing.T) {
+func TestAPI_ClientWatchList(t *testing.T) {
 	t.Parallel()
 	c, s := makeClient(t)
 	defer s.Stop()
@@ -337,7 +339,7 @@ func TestClient_WatchList(t *testing.T) {
 	<-doneCh
 }
 
-func TestClient_Keys_DeleteRecurse(t *testing.T) {
+func TestAPI_ClientKeys_DeleteRecurse(t *testing.T) {
 	t.Parallel()
 	c, s := makeClient(t)
 	defer s.Stop()
@@ -387,7 +389,7 @@ func TestClient_Keys_DeleteRecurse(t *testing.T) {
 	}
 }
 
-func TestClient_AcquireRelease(t *testing.T) {
+func TestAPI_ClientAcquireRelease(t *testing.T) {
 	t.Parallel()
 	c, s := makeClient(t)
 	defer s.Stop()
@@ -456,7 +458,7 @@ func TestClient_AcquireRelease(t *testing.T) {
 	}
 }
 
-func TestClient_Txn(t *testing.T) {
+func TestAPI_KVClientTxn(t *testing.T) {
 	t.Parallel()
 	c, s := makeClient(t)
 	defer s.Stop()

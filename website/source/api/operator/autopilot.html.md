@@ -14,7 +14,7 @@ The `/operator/autopilot` endpoints allow for automatic operator-friendly
 management of Consul servers including cleanup of dead servers, monitoring
 the state of the Raft cluster, and stable server introduction.
 
-Please see the [Autopilot Guide](/docs/guides/autopilot.html) for more details.
+Please see the [Autopilot Guide](https://learn.hashicorp.com/consul/day-2-operations/autopilot) for more details.
 
 ## Read Configuration
 
@@ -25,13 +25,14 @@ This endpoint retrieves its latest Autopilot configuration.
 | `GET`  | `/operator/autopilot/configuration` | `application/json` |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
-| Blocking Queries | Consistency Modes | ACL Required    |
-| ---------------- | ----------------- | --------------- |
-| `NO`             | `none`            | `operator:read` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required    |
+| ---------------- | ----------------- | ------------- | --------------- |
+| `NO`             | `none`            | `none`        | `operator:read` |
 
 ### Parameters
 
@@ -47,7 +48,7 @@ The table below shows this endpoint's support for
 
 ```text
 $ curl \
-    https://consul.rocks/operator/autopilot/configuration
+    http://127.0.0.1:8500/operator/autopilot/configuration
 ```
 
 ### Sample Response
@@ -60,6 +61,7 @@ $ curl \
   "ServerStabilizationTime": "10s",
   "RedundancyZoneTag": "",
   "DisableUpgradeMigration": false,
+  "UpgradeVersionTag": "",
   "CreateIndex": 4,
   "ModifyIndex": 4
 }
@@ -77,13 +79,14 @@ This endpoint updates the Autopilot configuration of the cluster.
 | `PUT`  | `/operator/autopilot/configuration` | `application/json` |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
-| Blocking Queries | Consistency Modes | ACL Required     |
-| ---------------- | ----------------- | ---------------- |
-| `NO`             | `none`            | `opreator:write` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required     |
+| ---------------- | ----------------- | ------------- | ---------------- |
+| `NO`             | `none`            | `none`        | `operator:write` |
 
 ### Parameters
 
@@ -110,7 +113,7 @@ The table below shows this endpoint's support for
   cluster. Only takes effect if all servers are running Raft protocol version 3
   or higher. Must be a duration value such as `30s`.
 
-- `RedundancyZoneTag` `(string: "")` controls the node-meta key to use when
+- `RedundancyZoneTag` `(string: "")` - Controls the node-meta key to use when
   Autopilot is separating servers into zones for redundancy. Only one server in
   each zone can be a voting member at one time. If left blank, this feature will
   be disabled.
@@ -119,6 +122,10 @@ The table below shows this endpoint's support for
   migration strategy in Consul Enterprise of waiting until enough
   newer-versioned servers have been added to the cluster before promoting any of
   them to voters.
+
+- `UpgradeVersionTag` `(string: "")` - Controls the node-meta key to use for
+  version info when performing upgrade migrations. If left blank, the Consul
+  version will be used.
 
 ### Sample Payload
 
@@ -130,6 +137,7 @@ The table below shows this endpoint's support for
   "ServerStabilizationTime": "10s",
   "RedundancyZoneTag": "",
   "DisableUpgradeMigration": false,
+  "UpgradeVersionTag": "",
   "CreateIndex": 4,
   "ModifyIndex": 4
 }
@@ -144,13 +152,14 @@ This endpoint queries the health of the autopilot status.
 | `GET`  | `/operator/autopilot/health` | `application/json`         |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
-| Blocking Queries | Consistency Modes | ACL Required    |
-| ---------------- | ----------------- | --------------- |
-| `NO`             | `none`            | `opreator:read` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required    |
+| ---------------- | ----------------- | ------------- | --------------- |
+| `NO`             | `none`            | `none`        | `operator:read` |
 
 ### Parameters
 
@@ -162,7 +171,7 @@ The table below shows this endpoint's support for
 
 ```text
 $ curl \
-    https://consul.rocks/v1/operator/autopilot/health
+    http://127.0.0.1:8500/v1/operator/autopilot/health
 ```
 
 ### Sample response
@@ -235,3 +244,6 @@ $ curl \
   - `Voter` is whether the server is a voting member of the Raft cluster.
 
   - `StableSince` is the time this server has been in its current `Healthy` state.
+
+  The HTTP status code will indicate the health of the cluster. If `Healthy` is true, then a
+  status of 200 will be returned. If `Healthy` is false, then a status of 429 will be returned.

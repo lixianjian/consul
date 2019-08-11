@@ -13,10 +13,6 @@ box. UIs can be used for viewing all services and nodes, for viewing
 all health checks and their current status, and for reading and setting
 key/value data. The UIs automatically support multi-datacenter.
 
-<div class="center">
-![Consul Web UI](consul_web_ui.png)
-</div>
-
 To set up the self-hosted UI, start the Consul agent with the
 [`-ui` parameter](/docs/agent/options.html#_ui):
 

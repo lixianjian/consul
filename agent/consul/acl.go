@@ -1,34 +1,24 @@
 package consul
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"os"
-	"strings"
+	"sort"
+	"sync"
 	"time"
 
-	"github.com/armon/go-metrics"
+	metrics "github.com/armon/go-metrics"
 	"github.com/hashicorp/consul/acl"
-	"github.com/hashicorp/consul/agent/consul/structs"
-	"github.com/hashicorp/golang-lru"
+	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/api"
+	"github.com/hashicorp/consul/sentinel"
+	"golang.org/x/sync/singleflight"
+	"golang.org/x/time/rate"
 )
 
 // These must be kept in sync with the constants in command/agent/acl.go.
 const (
-	// aclNotFound indicates there is no matching ACL.
-	aclNotFound = "ACL not found"
-
-	// rootDenied is returned when attempting to resolve a root ACL.
-	rootDenied = "Cannot resolve root ACL"
-
-	// permissionDenied is returned when an ACL based rejection happens.
-	permissionDenied = "Permission denied"
-
-	// aclDisabled is returned when ACL changes are not permitted since they
-	// are disabled.
-	aclDisabled = "ACL support disabled"
-
 	// anonymousToken is the token ID we re-write to if there is no token ID
 	// provided.
 	anonymousToken = "anonymous"
@@ -37,291 +27,1032 @@ const (
 	// are not allowed to be displayed.
 	redactedToken = "<hidden>"
 
-	// Maximum number of cached ACL entries.
-	aclCacheSize = 10 * 1024
+	// aclUpgradeBatchSize controls how many tokens we look at during each round of upgrading. Individual raft logs
+	// will be further capped using the aclBatchUpsertSize. This limit just prevents us from creating a single slice
+	// with all tokens in it.
+	aclUpgradeBatchSize = 128
+
+	// aclUpgradeRateLimit is the number of batch upgrade requests per second allowed.
+	aclUpgradeRateLimit rate.Limit = 1.0
+
+	// aclTokenReapingRateLimit is the number of batch token reaping requests per second allowed.
+	aclTokenReapingRateLimit rate.Limit = 1.0
+
+	// aclTokenReapingBurst is the number of batch token reaping requests per second
+	// that can burst after a period of idleness.
+	aclTokenReapingBurst = 5
+
+	// aclBatchDeleteSize is the number of deletions to send in a single batch operation. 4096 should produce a batch that is <150KB
+	// in size but should be sufficiently large to handle 1 replication round in a single batch
+	aclBatchDeleteSize = 4096
+
+	// aclBatchUpsertSize is the target size in bytes we want to submit for a batch upsert request. We estimate the size at runtime
+	// due to the data being more variable in its size.
+	aclBatchUpsertSize = 256 * 1024
+
+	// DEPRECATED (ACL-Legacy-Compat) aclModeCheck* are all only for legacy usage
+	// aclModeCheckMinInterval is the minimum amount of time between checking if the
+	// agent should be using the new or legacy ACL system. All the places it is
+	// currently used will backoff as it detects that it is remaining in legacy mode.
+	// However the initial min value is kept small so that new cluster creation
+	// can enter into new ACL mode quickly.
+	aclModeCheckMinInterval = 50 * time.Millisecond
+
+	// aclModeCheckMaxInterval controls the maximum interval for how often the agent
+	// checks if it should be using the new or legacy ACL system.
+	aclModeCheckMaxInterval = 30 * time.Second
+
+	// Maximum number of re-resolution requests to be made if the token is modified between
+	// resolving the token and resolving its policies that would remove one of its policies.
+	tokenPolicyResolutionMaxRetries = 5
+
+	// Maximum number of re-resolution requests to be made if the token is modified between
+	// resolving the token and resolving its roles that would remove one of its roles.
+	tokenRoleResolutionMaxRetries = 5
 )
 
-var errPermissionDenied = errors.New(permissionDenied)
-
-// aclCacheEntry is used to cache non-authoritative ACLs
-// If non-authoritative, then we must respect a TTL
-type aclCacheEntry struct {
-	ACL     acl.ACL
-	Expires time.Time
-	ETag    string
+func minTTL(a time.Duration, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
-// aclLocalFault is used by the authoritative ACL cache to fault in the rules
-// for an ACL if we take a miss. This goes directly to the state store, so it
-// assumes its running in the ACL datacenter, or in a non-ACL datacenter when
-// using its replicated ACLs during an outage.
-func (s *Server) aclLocalFault(id string) (string, string, error) {
-	defer metrics.MeasureSince([]string{"consul", "acl", "fault"}, time.Now())
-
-	// Query the state store.
-	state := s.fsm.State()
-	_, acl, err := state.ACLGet(nil, id)
-	if err != nil {
-		return "", "", err
-	}
-	if acl == nil {
-		return "", "", errors.New(aclNotFound)
-	}
-
-	// Management tokens have no policy and inherit from the 'manage' root
-	// policy.
-	if acl.Type == structs.ACLTypeManagement {
-		return "manage", "", nil
-	}
-
-	// Otherwise use the default policy.
-	return s.config.ACLDefaultPolicy, acl.Rules, nil
+type ACLRemoteError struct {
+	Err error
 }
 
-// resolveToken is the primary interface used by ACL-checkers (such as an
-// endpoint handling a request) to resolve a token. If ACLs aren't enabled
-// then this will return a nil token, otherwise it will attempt to use local
-// cache and ultimately the ACL datacenter to get the policy associated with the
-// token.
-func (s *Server) resolveToken(id string) (acl.ACL, error) {
-	// Check if there is no ACL datacenter (ACLs disabled)
-	authDC := s.config.ACLDatacenter
-	if len(authDC) == 0 {
-		return nil, nil
-	}
-	defer metrics.MeasureSince([]string{"consul", "acl", "resolveToken"}, time.Now())
-
-	// Handle the anonymous token
-	if len(id) == 0 {
-		id = anonymousToken
-	} else if acl.RootACL(id) != nil {
-		return nil, errors.New(rootDenied)
-	}
-
-	// Check if we are the ACL datacenter and the leader, use the
-	// authoritative cache
-	if s.config.Datacenter == authDC && s.IsLeader() {
-		return s.aclAuthCache.GetACL(id)
-	}
-
-	// Use our non-authoritative cache
-	return s.aclCache.lookupACL(id, authDC)
+func (e ACLRemoteError) Error() string {
+	return fmt.Sprintf("Error communicating with the ACL Datacenter: %v", e.Err)
 }
 
-// rpcFn is used to make an RPC call to the client or server.
-type rpcFn func(string, interface{}, interface{}) error
+func IsACLRemoteError(err error) bool {
+	_, ok := err.(ACLRemoteError)
+	return ok
+}
 
-// aclCache is used to cache ACLs and policies.
-type aclCache struct {
+type ACLResolverDelegate interface {
+	ACLsEnabled() bool
+	ACLDatacenter(legacy bool) string
+	UseLegacyACLs() bool
+	ResolveIdentityFromToken(token string) (bool, structs.ACLIdentity, error)
+	ResolvePolicyFromID(policyID string) (bool, *structs.ACLPolicy, error)
+	ResolveRoleFromID(roleID string) (bool, *structs.ACLRole, error)
+	RPC(method string, args interface{}, reply interface{}) error
+}
+
+type policyOrRoleTokenError struct {
+	Err   error
+	token string
+}
+
+func (e policyOrRoleTokenError) Error() string {
+	return e.Err.Error()
+}
+
+// ACLResolverConfig holds all the configuration necessary to create an ACLResolver
+type ACLResolverConfig struct {
+	Config *Config
+	Logger *log.Logger
+
+	// CacheConfig is a pass through configuration for ACL cache limits
+	CacheConfig *structs.ACLCachesConfig
+
+	// Delegate that implements some helper functionality that is server/client specific
+	Delegate ACLResolverDelegate
+
+	// AutoDisable indicates that RPC responses should be checked and if they indicate ACLs are disabled
+	// remotely then disable them locally as well. This is particularly useful for the client agent
+	// so that it can detect when the servers have gotten ACLs enabled.
+	AutoDisable bool
+
+	Sentinel sentinel.Evaluator
+}
+
+// ACLResolver is the type to handle all your token and policy resolution needs.
+//
+// Supports:
+//   - Resolving tokens locally via the ACLResolverDelegate
+//   - Resolving policies locally via the ACLResolverDelegate
+//   - Resolving roles locally via the ACLResolverDelegate
+//   - Resolving legacy tokens remotely via a ACL.GetPolicy RPC
+//   - Resolving tokens remotely via an ACL.TokenRead RPC
+//   - Resolving policies remotely via an ACL.PolicyResolve RPC
+//   - Resolving roles remotely via an ACL.RoleResolve RPC
+//
+// Remote Resolution:
+//   Remote resolution can be done synchronously or asynchronously depending
+//   on the ACLDownPolicy in the Config passed to the resolver.
+//
+//   When the down policy is set to async-cache and we have already cached values
+//   then go routines will be spawned to perform the RPCs in the background
+//   and then will update the cache with either the positive or negative result.
+//
+//   When the down policy is set to extend-cache or the token/policy/role is not already
+//   cached then the same go routines are spawned to do the RPCs in the background.
+//   However in this mode channels are created to receive the results of the RPC
+//   and are registered with the resolver. Those channels are immediately read/blocked
+//   upon.
+//
+type ACLResolver struct {
 	config *Config
 	logger *log.Logger
 
-	// acls is a non-authoritative ACL cache.
-	acls *lru.TwoQueueCache
+	delegate ACLResolverDelegate
+	sentinel sentinel.Evaluator
 
-	// aclPolicyCache is a non-authoritative policy cache.
-	policies *lru.TwoQueueCache
+	cache         *structs.ACLCaches
+	identityGroup singleflight.Group
+	policyGroup   singleflight.Group
+	roleGroup     singleflight.Group
+	legacyGroup   singleflight.Group
 
-	// rpc is a function used to talk to the client/server.
-	rpc rpcFn
+	down acl.Authorizer
 
-	// local is a function used to look for an ACL locally if replication is
-	// enabled. This will be nil if replication isn't enabled.
-	local acl.FaultFunc
+	autoDisable  bool
+	disabled     time.Time
+	disabledLock sync.RWMutex
 }
 
-// newACLCache returns a new non-authoritative cache for ACLs. This is used for
-// performance, and is used inside the ACL datacenter on non-leader servers, and
-// outside the ACL datacenter everywhere.
-func newACLCache(conf *Config, logger *log.Logger, rpc rpcFn, local acl.FaultFunc) (*aclCache, error) {
-	var err error
-	cache := &aclCache{
-		config: conf,
-		logger: logger,
-		rpc:    rpc,
-		local:  local,
+func NewACLResolver(config *ACLResolverConfig) (*ACLResolver, error) {
+	if config == nil {
+		return nil, fmt.Errorf("ACL Resolver must be initialized with a config")
 	}
 
-	// Initialize the non-authoritative ACL cache
-	cache.acls, err = lru.New2Q(aclCacheSize)
+	if config.Config == nil {
+		return nil, fmt.Errorf("ACLResolverConfig.Config must not be nil")
+	}
+
+	if config.Delegate == nil {
+		return nil, fmt.Errorf("ACL Resolver must be initialized with a valid delegate")
+	}
+
+	if config.Logger == nil {
+		config.Logger = log.New(os.Stderr, "", log.LstdFlags)
+	}
+
+	cache, err := structs.NewACLCaches(config.CacheConfig)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to create ACL cache: %v", err)
+		return nil, err
 	}
 
-	// Initialize the ACL policy cache
-	cache.policies, err = lru.New2Q(aclCacheSize)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to create ACL policy cache: %v", err)
-	}
-
-	return cache, nil
-}
-
-// lookupACL is used when we are non-authoritative, and need to resolve an ACL.
-func (c *aclCache) lookupACL(id, authDC string) (acl.ACL, error) {
-	// Check the cache for the ACL.
-	var cached *aclCacheEntry
-	raw, ok := c.acls.Get(id)
-	if ok {
-		cached = raw.(*aclCacheEntry)
-	}
-
-	// Check for live cache.
-	if cached != nil && time.Now().Before(cached.Expires) {
-		metrics.IncrCounter([]string{"consul", "acl", "cache_hit"}, 1)
-		return cached.ACL, nil
-	}
-	metrics.IncrCounter([]string{"consul", "acl", "cache_miss"}, 1)
-
-	// Attempt to refresh the policy from the ACL datacenter via an RPC.
-	args := structs.ACLPolicyRequest{
-		Datacenter: authDC,
-		ACL:        id,
-	}
-	if cached != nil {
-		args.ETag = cached.ETag
-	}
-	var reply structs.ACLPolicy
-	err := c.rpc("ACL.GetPolicy", &args, &reply)
-	if err == nil {
-		return c.useACLPolicy(id, authDC, cached, &reply)
-	}
-
-	// Check for not-found, which will cause us to bail immediately. For any
-	// other error we report it in the logs but can continue.
-	if strings.Contains(err.Error(), aclNotFound) {
-		return nil, errors.New(aclNotFound)
-	}
-	c.logger.Printf("[ERR] consul.acl: Failed to get policy from ACL datacenter: %v", err)
-
-	// TODO (slackpad) - We could do a similar thing *within* the ACL
-	// datacenter if the leader isn't available. We have a local state
-	// store of the ACLs, so by populating the local member in this cache,
-	// it would fall back to the state store if there was a leader loss and
-	// the extend-cache policy was true. This feels subtle to explain and
-	// configure, and leader blips should be paved over by cache already, so
-	// we won't do this for now but should consider for the future. This is
-	// a lot different than the replication story where you might be cut off
-	// from the ACL datacenter for an extended period of time and need to
-	// carry on operating with the full set of ACLs as they were known
-	// before the partition.
-
-	// At this point we might have an expired cache entry and we know that
-	// there was a problem getting the ACL from the ACL datacenter. If a
-	// local ACL fault function is registered to query replicated ACL data,
-	// and the user's policy allows it, we will try locally before we give
-	// up.
-	if c.local != nil && c.config.ACLDownPolicy == "extend-cache" {
-		parent, rules, err := c.local(id)
-		if err != nil {
-			// We don't make an exception here for ACLs that aren't
-			// found locally. It seems more robust to use an expired
-			// cached entry (if we have one) rather than ignore it
-			// for the case that replication was a bit behind and
-			// didn't have the ACL yet.
-			c.logger.Printf("[DEBUG] consul.acl: Failed to get policy from replicated ACLs: %v", err)
-			goto ACL_DOWN
-		}
-
-		policy, err := acl.Parse(rules)
-		if err != nil {
-			c.logger.Printf("[DEBUG] consul.acl: Failed to parse policy for replicated ACL: %v", err)
-			goto ACL_DOWN
-		}
-		policy.ID = acl.RuleID(rules)
-
-		// Fake up an ACL datacenter reply and inject it into the cache.
-		// Note we use the local TTL here, so this'll be used for that
-		// amount of time even once the ACL datacenter becomes available.
-		metrics.IncrCounter([]string{"consul", "acl", "replication_hit"}, 1)
-		reply.ETag = makeACLETag(parent, policy)
-		reply.TTL = c.config.ACLTTL
-		reply.Parent = parent
-		reply.Policy = policy
-		return c.useACLPolicy(id, authDC, cached, &reply)
-	}
-
-ACL_DOWN:
-	// Unable to refresh, apply the down policy.
-	switch c.config.ACLDownPolicy {
+	var down acl.Authorizer
+	switch config.Config.ACLDownPolicy {
 	case "allow":
+		down = acl.AllowAll()
+	case "deny":
+		down = acl.DenyAll()
+	case "async-cache", "extend-cache":
+		// Leave the down policy as nil to signal this.
+	default:
+		return nil, fmt.Errorf("invalid ACL down policy %q", config.Config.ACLDownPolicy)
+	}
+
+	return &ACLResolver{
+		config:      config.Config,
+		logger:      config.Logger,
+		delegate:    config.Delegate,
+		sentinel:    config.Sentinel,
+		cache:       cache,
+		autoDisable: config.AutoDisable,
+		down:        down,
+	}, nil
+}
+
+func (r *ACLResolver) fetchAndCacheTokenLegacy(token string, cached *structs.AuthorizerCacheEntry) (acl.Authorizer, error) {
+	req := structs.ACLPolicyResolveLegacyRequest{
+		Datacenter: r.delegate.ACLDatacenter(true),
+		ACL:        token,
+	}
+
+	cacheTTL := r.config.ACLTokenTTL
+	if cached != nil {
+		cacheTTL = cached.TTL
+	}
+
+	var reply structs.ACLPolicyResolveLegacyResponse
+	err := r.delegate.RPC("ACL.GetPolicy", &req, &reply)
+	if err == nil {
+		parent := acl.RootAuthorizer(reply.Parent)
+		if parent == nil {
+			var authorizer acl.Authorizer
+			if cached != nil {
+				authorizer = cached.Authorizer
+			}
+			r.cache.PutAuthorizerWithTTL(token, authorizer, cacheTTL)
+			return authorizer, acl.ErrInvalidParent
+		}
+
+		var policies []*acl.Policy
+		policy := reply.Policy
+		if policy != nil {
+			policies = append(policies, policy.ConvertFromLegacy())
+		}
+
+		authorizer, err := acl.NewPolicyAuthorizer(parent, policies, r.sentinel)
+
+		r.cache.PutAuthorizerWithTTL(token, authorizer, reply.TTL)
+		return authorizer, err
+	}
+
+	if acl.IsErrNotFound(err) {
+		// Make sure to remove from the cache if it was deleted
+		r.cache.PutAuthorizerWithTTL(token, nil, cacheTTL)
+		return nil, acl.ErrNotFound
+
+	}
+
+	// some other RPC error
+	switch r.config.ACLDownPolicy {
+	case "allow":
+		r.cache.PutAuthorizerWithTTL(token, acl.AllowAll(), cacheTTL)
 		return acl.AllowAll(), nil
-	case "extend-cache":
+	case "async-cache", "extend-cache":
 		if cached != nil {
-			return cached.ACL, nil
+			r.cache.PutAuthorizerWithTTL(token, cached.Authorizer, cacheTTL)
+			return cached.Authorizer, nil
 		}
 		fallthrough
 	default:
+		r.cache.PutAuthorizerWithTTL(token, acl.DenyAll(), cacheTTL)
 		return acl.DenyAll(), nil
 	}
 }
 
-// useACLPolicy handles an ACLPolicy response
-func (c *aclCache) useACLPolicy(id, authDC string, cached *aclCacheEntry, p *structs.ACLPolicy) (acl.ACL, error) {
-	// Check if we can used the cached policy
-	if cached != nil && cached.ETag == p.ETag {
-		if p.TTL > 0 {
-			// TODO (slackpad) - This seems like it's an unsafe
-			// write.
-			cached.Expires = time.Now().Add(p.TTL)
-		}
-		return cached.ACL, nil
-	}
+func (r *ACLResolver) resolveTokenLegacy(token string) (acl.Authorizer, error) {
+	defer metrics.MeasureSince([]string{"acl", "resolveTokenLegacy"}, time.Now())
 
-	// Check for a cached compiled policy
-	var compiled acl.ACL
-	raw, ok := c.policies.Get(p.ETag)
-	if ok {
-		compiled = raw.(acl.ACL)
-	} else {
-		// Resolve the parent policy
-		parent := acl.RootACL(p.Parent)
-		if parent == nil {
-			var err error
-			parent, err = c.lookupACL(p.Parent, authDC)
+	// Attempt to resolve locally first (local results are not cached)
+	// This is only useful for servers where either legacy replication is being
+	// done or the server is within the primary datacenter.
+	if done, identity, err := r.delegate.ResolveIdentityFromToken(token); done {
+		if err == nil && identity != nil {
+			policies, err := r.resolvePoliciesForIdentity(identity)
 			if err != nil {
 				return nil, err
 			}
+
+			return policies.Compile(acl.RootAuthorizer(r.config.ACLDefaultPolicy), r.cache, r.sentinel)
 		}
 
-		// Compile the ACL
-		acl, err := acl.New(parent, p.Policy)
+		return nil, err
+	}
+
+	// Look in the cache prior to making a RPC request
+	entry := r.cache.GetAuthorizer(token)
+
+	if entry != nil && entry.Age() <= minTTL(entry.TTL, r.config.ACLTokenTTL) {
+		metrics.IncrCounter([]string{"acl", "token", "cache_hit"}, 1)
+		if entry.Authorizer != nil {
+			return entry.Authorizer, nil
+		}
+		return nil, acl.ErrNotFound
+	}
+
+	metrics.IncrCounter([]string{"acl", "token", "cache_miss"}, 1)
+
+	// Resolve the token in the background and wait on the result if we must
+	waitChan := r.legacyGroup.DoChan(token, func() (interface{}, error) {
+		authorizer, err := r.fetchAndCacheTokenLegacy(token, entry)
+		return authorizer, err
+	})
+
+	waitForResult := entry == nil || r.config.ACLDownPolicy != "async-cache"
+	if !waitForResult {
+		// waitForResult being false requires the cacheEntry to not be nil
+		if entry.Authorizer != nil {
+			return entry.Authorizer, nil
+		}
+		return nil, acl.ErrNotFound
+	}
+
+	// block waiting for the async RPC to finish.
+	res := <-waitChan
+
+	var authorizer acl.Authorizer
+	if res.Val != nil { // avoid a nil-not-nil bug
+		authorizer = res.Val.(acl.Authorizer)
+	}
+
+	return authorizer, res.Err
+}
+
+func (r *ACLResolver) fetchAndCacheIdentityFromToken(token string, cached *structs.IdentityCacheEntry) (structs.ACLIdentity, error) {
+	req := structs.ACLTokenGetRequest{
+		Datacenter:  r.delegate.ACLDatacenter(false),
+		TokenID:     token,
+		TokenIDType: structs.ACLTokenSecret,
+		QueryOptions: structs.QueryOptions{
+			Token:      token,
+			AllowStale: true,
+		},
+	}
+
+	var resp structs.ACLTokenResponse
+	err := r.delegate.RPC("ACL.TokenRead", &req, &resp)
+	if err == nil {
+		if resp.Token == nil {
+			r.cache.PutIdentity(token, nil)
+			return nil, acl.ErrNotFound
+		} else {
+			r.cache.PutIdentity(token, resp.Token)
+			return resp.Token, nil
+		}
+	}
+
+	if acl.IsErrNotFound(err) {
+		// Make sure to remove from the cache if it was deleted
+		r.cache.PutIdentity(token, nil)
+		return nil, acl.ErrNotFound
+
+	}
+
+	// some other RPC error
+	if cached != nil && (r.config.ACLDownPolicy == "extend-cache" || r.config.ACLDownPolicy == "async-cache") {
+		// extend the cache
+		r.cache.PutIdentity(token, cached.Identity)
+		return cached.Identity, nil
+	}
+
+	r.cache.PutIdentity(token, nil)
+	return nil, err
+}
+
+func (r *ACLResolver) resolveIdentityFromToken(token string) (structs.ACLIdentity, error) {
+	// Attempt to resolve locally first (local results are not cached)
+	if done, identity, err := r.delegate.ResolveIdentityFromToken(token); done {
+		return identity, err
+	}
+
+	// Check the cache before making any RPC requests
+	cacheEntry := r.cache.GetIdentity(token)
+	if cacheEntry != nil && cacheEntry.Age() <= r.config.ACLTokenTTL {
+		metrics.IncrCounter([]string{"acl", "token", "cache_hit"}, 1)
+		return cacheEntry.Identity, nil
+	}
+
+	metrics.IncrCounter([]string{"acl", "token", "cache_miss"}, 1)
+
+	// Background a RPC request and wait on it if we must
+	waitChan := r.identityGroup.DoChan(token, func() (interface{}, error) {
+		identity, err := r.fetchAndCacheIdentityFromToken(token, cacheEntry)
+		return identity, err
+	})
+
+	waitForResult := cacheEntry == nil || r.config.ACLDownPolicy != "async-cache"
+	if !waitForResult {
+		// waitForResult being false requires the cacheEntry to not be nil
+		return cacheEntry.Identity, nil
+	}
+
+	// block on the read here, this is why we don't need chan buffering
+	res := <-waitChan
+
+	var identity structs.ACLIdentity
+	if res.Val != nil { // avoid a nil-not-nil bug
+		identity = res.Val.(structs.ACLIdentity)
+	}
+
+	if res.Err != nil && !acl.IsErrNotFound(res.Err) {
+		return identity, ACLRemoteError{Err: res.Err}
+	}
+	return identity, res.Err
+}
+
+func (r *ACLResolver) fetchAndCachePoliciesForIdentity(identity structs.ACLIdentity, policyIDs []string, cached map[string]*structs.PolicyCacheEntry) (map[string]*structs.ACLPolicy, error) {
+	req := structs.ACLPolicyBatchGetRequest{
+		Datacenter: r.delegate.ACLDatacenter(false),
+		PolicyIDs:  policyIDs,
+		QueryOptions: structs.QueryOptions{
+			Token:      identity.SecretToken(),
+			AllowStale: true,
+		},
+	}
+
+	var resp structs.ACLPolicyBatchResponse
+	err := r.delegate.RPC("ACL.PolicyResolve", &req, &resp)
+	if err == nil {
+		out := make(map[string]*structs.ACLPolicy)
+		for _, policy := range resp.Policies {
+			out[policy.ID] = policy
+		}
+
+		for _, policyID := range policyIDs {
+			if policy, ok := out[policyID]; ok {
+				r.cache.PutPolicy(policyID, policy)
+			} else {
+				r.cache.PutPolicy(policyID, nil)
+			}
+		}
+		return out, nil
+	}
+
+	if handledErr := r.maybeHandleIdentityErrorDuringFetch(identity, err); handledErr != nil {
+		return nil, handledErr
+	}
+
+	// other RPC error - use cache if available
+
+	extendCache := r.config.ACLDownPolicy == "extend-cache" || r.config.ACLDownPolicy == "async-cache"
+
+	out := make(map[string]*structs.ACLPolicy)
+	insufficientCache := false
+	for _, policyID := range policyIDs {
+		if entry, ok := cached[policyID]; extendCache && ok {
+			r.cache.PutPolicy(policyID, entry.Policy)
+			if entry.Policy != nil {
+				out[policyID] = entry.Policy
+			}
+		} else {
+			r.cache.PutPolicy(policyID, nil)
+			insufficientCache = true
+		}
+	}
+	if insufficientCache {
+		return nil, ACLRemoteError{Err: err}
+	}
+	return out, nil
+}
+
+func (r *ACLResolver) fetchAndCacheRolesForIdentity(identity structs.ACLIdentity, roleIDs []string, cached map[string]*structs.RoleCacheEntry) (map[string]*structs.ACLRole, error) {
+	req := structs.ACLRoleBatchGetRequest{
+		Datacenter: r.delegate.ACLDatacenter(false),
+		RoleIDs:    roleIDs,
+		QueryOptions: structs.QueryOptions{
+			Token:      identity.SecretToken(),
+			AllowStale: true,
+		},
+	}
+
+	var resp structs.ACLRoleBatchResponse
+	err := r.delegate.RPC("ACL.RoleResolve", &req, &resp)
+	if err == nil {
+		out := make(map[string]*structs.ACLRole)
+		for _, role := range resp.Roles {
+			out[role.ID] = role
+		}
+
+		for _, roleID := range roleIDs {
+			if role, ok := out[roleID]; ok {
+				r.cache.PutRole(roleID, role)
+			} else {
+				r.cache.PutRole(roleID, nil)
+			}
+		}
+		return out, nil
+	}
+
+	if handledErr := r.maybeHandleIdentityErrorDuringFetch(identity, err); handledErr != nil {
+		return nil, handledErr
+	}
+
+	// other RPC error - use cache if available
+
+	extendCache := r.config.ACLDownPolicy == "extend-cache" || r.config.ACLDownPolicy == "async-cache"
+
+	out := make(map[string]*structs.ACLRole)
+	insufficientCache := false
+	for _, roleID := range roleIDs {
+		if entry, ok := cached[roleID]; extendCache && ok {
+			r.cache.PutRole(roleID, entry.Role)
+			if entry.Role != nil {
+				out[roleID] = entry.Role
+			}
+		} else {
+			r.cache.PutRole(roleID, nil)
+			insufficientCache = true
+		}
+	}
+
+	if insufficientCache {
+		return nil, ACLRemoteError{Err: err}
+	}
+
+	return out, nil
+}
+
+func (r *ACLResolver) maybeHandleIdentityErrorDuringFetch(identity structs.ACLIdentity, err error) error {
+	if acl.IsErrNotFound(err) {
+		// make sure to indicate that this identity is no longer valid within
+		// the cache
+		r.cache.PutIdentity(identity.SecretToken(), nil)
+
+		// Do not touch the cache. Getting a top level ACL not found error
+		// only indicates that the secret token used in the request
+		// no longer exists
+		return &policyOrRoleTokenError{acl.ErrNotFound, identity.SecretToken()}
+	}
+
+	if acl.IsErrPermissionDenied(err) {
+		// invalidate our ID cache so that identity resolution will take place
+		// again in the future
+		r.cache.RemoveIdentity(identity.SecretToken())
+
+		// Do not remove from the cache for permission denied
+		// what this does indicate is that our view of the token is out of date
+		return &policyOrRoleTokenError{acl.ErrPermissionDenied, identity.SecretToken()}
+	}
+
+	return nil
+}
+
+func (r *ACLResolver) filterPoliciesByScope(policies structs.ACLPolicies) structs.ACLPolicies {
+	var out structs.ACLPolicies
+	for _, policy := range policies {
+		if len(policy.Datacenters) == 0 {
+			out = append(out, policy)
+			continue
+		}
+
+		for _, dc := range policy.Datacenters {
+			if dc == r.config.Datacenter {
+				out = append(out, policy)
+				continue
+			}
+		}
+	}
+
+	return out
+}
+
+func (r *ACLResolver) resolvePoliciesForIdentity(identity structs.ACLIdentity) (structs.ACLPolicies, error) {
+	policyIDs := identity.PolicyIDs()
+	roleIDs := identity.RoleIDs()
+	serviceIdentities := identity.ServiceIdentityList()
+
+	if len(policyIDs) == 0 && len(serviceIdentities) == 0 && len(roleIDs) == 0 {
+		policy := identity.EmbeddedPolicy()
+		if policy != nil {
+			return []*structs.ACLPolicy{policy}, nil
+		}
+
+		// In this case the default policy will be all that is in effect.
+		return nil, nil
+	}
+
+	// Collect all of the roles tied to this token.
+	roles, err := r.collectRolesForIdentity(identity, roleIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	// Merge the policies and service identities across Token and Role fields.
+	for _, role := range roles {
+		for _, link := range role.Policies {
+			policyIDs = append(policyIDs, link.ID)
+		}
+		serviceIdentities = append(serviceIdentities, role.ServiceIdentities...)
+	}
+
+	// Now deduplicate any policies or service identities that occur more than once.
+	policyIDs = dedupeStringSlice(policyIDs)
+	serviceIdentities = dedupeServiceIdentities(serviceIdentities)
+
+	// Generate synthetic policies for all service identities in effect.
+	syntheticPolicies := r.synthesizePoliciesForServiceIdentities(serviceIdentities)
+
+	// For the new ACLs policy replication is mandatory for correct operation on servers. Therefore
+	// we only attempt to resolve policies locally
+	policies, err := r.collectPoliciesForIdentity(identity, policyIDs, len(syntheticPolicies))
+	if err != nil {
+		return nil, err
+	}
+
+	policies = append(policies, syntheticPolicies...)
+	filtered := r.filterPoliciesByScope(policies)
+	return filtered, nil
+}
+
+func (r *ACLResolver) synthesizePoliciesForServiceIdentities(serviceIdentities []*structs.ACLServiceIdentity) []*structs.ACLPolicy {
+	if len(serviceIdentities) == 0 {
+		return nil
+	}
+
+	syntheticPolicies := make([]*structs.ACLPolicy, 0, len(serviceIdentities))
+	for _, s := range serviceIdentities {
+		syntheticPolicies = append(syntheticPolicies, s.SyntheticPolicy())
+	}
+
+	return syntheticPolicies
+}
+
+func dedupeServiceIdentities(in []*structs.ACLServiceIdentity) []*structs.ACLServiceIdentity {
+	// From: https://github.com/golang/go/wiki/SliceTricks#in-place-deduplicate-comparable
+
+	if len(in) <= 1 {
+		return in
+	}
+
+	sort.Slice(in, func(i, j int) bool {
+		return in[i].ServiceName < in[j].ServiceName
+	})
+
+	j := 0
+	for i := 1; i < len(in); i++ {
+		if in[j].ServiceName == in[i].ServiceName {
+			// Prefer increasing scope.
+			if len(in[j].Datacenters) == 0 || len(in[i].Datacenters) == 0 {
+				in[j].Datacenters = nil
+			} else {
+				in[j].Datacenters = mergeStringSlice(in[j].Datacenters, in[i].Datacenters)
+			}
+			continue
+		}
+		j++
+		in[j] = in[i]
+	}
+
+	// Discard the skipped items.
+	for i := j + 1; i < len(in); i++ {
+		in[i] = nil
+	}
+
+	return in[:j+1]
+}
+
+func mergeStringSlice(a, b []string) []string {
+	out := make([]string, 0, len(a)+len(b))
+	out = append(out, a...)
+	out = append(out, b...)
+	return dedupeStringSlice(out)
+}
+
+func dedupeStringSlice(in []string) []string {
+	// From: https://github.com/golang/go/wiki/SliceTricks#in-place-deduplicate-comparable
+
+	if len(in) <= 1 {
+		return in
+	}
+
+	sort.Strings(in)
+
+	j := 0
+	for i := 1; i < len(in); i++ {
+		if in[j] == in[i] {
+			continue
+		}
+		j++
+		in[j] = in[i]
+	}
+
+	return in[:j+1]
+}
+
+func (r *ACLResolver) collectPoliciesForIdentity(identity structs.ACLIdentity, policyIDs []string, extraCap int) ([]*structs.ACLPolicy, error) {
+	policies := make([]*structs.ACLPolicy, 0, len(policyIDs)+extraCap)
+
+	// Get all associated policies
+	var missing []string
+	var expired []*structs.ACLPolicy
+	expCacheMap := make(map[string]*structs.PolicyCacheEntry)
+
+	for _, policyID := range policyIDs {
+		if done, policy, err := r.delegate.ResolvePolicyFromID(policyID); done {
+			if err != nil && !acl.IsErrNotFound(err) {
+				return nil, err
+			}
+
+			if policy != nil {
+				policies = append(policies, policy)
+			} else {
+				r.logger.Printf("[WARN] acl: policy %q not found for identity %q", policyID, identity.ID())
+			}
+
+			continue
+		}
+
+		// create the missing list which we can execute an RPC to get all the missing policies at once
+		entry := r.cache.GetPolicy(policyID)
+		if entry == nil {
+			missing = append(missing, policyID)
+			continue
+		}
+
+		if entry.Policy == nil {
+			// this happens when we cache a negative response for the policy's existence
+			continue
+		}
+
+		if entry.Age() >= r.config.ACLPolicyTTL {
+			expired = append(expired, entry.Policy)
+			expCacheMap[policyID] = entry
+		} else {
+			policies = append(policies, entry.Policy)
+		}
+	}
+
+	// Hot-path if we have no missing or expired policies
+	if len(missing)+len(expired) == 0 {
+		return policies, nil
+	}
+
+	hasMissing := len(missing) > 0
+
+	fetchIDs := missing
+	for _, policy := range expired {
+		fetchIDs = append(fetchIDs, policy.ID)
+	}
+
+	// Background a RPC request and wait on it if we must
+	waitChan := r.policyGroup.DoChan(identity.SecretToken(), func() (interface{}, error) {
+		policies, err := r.fetchAndCachePoliciesForIdentity(identity, fetchIDs, expCacheMap)
+		return policies, err
+	})
+
+	waitForResult := hasMissing || r.config.ACLDownPolicy != "async-cache"
+	if !waitForResult {
+		// waitForResult being false requires that all the policies were cached already
+		policies = append(policies, expired...)
+		return policies, nil
+	}
+
+	res := <-waitChan
+
+	if res.Err != nil {
+		return nil, res.Err
+	}
+
+	if res.Val != nil {
+		foundPolicies := res.Val.(map[string]*structs.ACLPolicy)
+
+		for _, policy := range foundPolicies {
+			policies = append(policies, policy)
+		}
+	}
+
+	return policies, nil
+}
+
+func (r *ACLResolver) resolveRolesForIdentity(identity structs.ACLIdentity) (structs.ACLRoles, error) {
+	return r.collectRolesForIdentity(identity, identity.RoleIDs())
+}
+
+func (r *ACLResolver) collectRolesForIdentity(identity structs.ACLIdentity, roleIDs []string) (structs.ACLRoles, error) {
+	if len(roleIDs) == 0 {
+		return nil, nil
+	}
+
+	// For the new ACLs policy & role replication is mandatory for correct operation
+	// on servers. Therefore we only attempt to resolve roles locally
+	roles := make([]*structs.ACLRole, 0, len(roleIDs))
+
+	var missing []string
+	var expired []*structs.ACLRole
+	expCacheMap := make(map[string]*structs.RoleCacheEntry)
+
+	for _, roleID := range roleIDs {
+		if done, role, err := r.delegate.ResolveRoleFromID(roleID); done {
+			if err != nil && !acl.IsErrNotFound(err) {
+				return nil, err
+			}
+
+			if role != nil {
+				roles = append(roles, role)
+			} else {
+				r.logger.Printf("[WARN] acl: role %q not found for identity %q", roleID, identity.ID())
+			}
+
+			continue
+		}
+
+		// create the missing list which we can execute an RPC to get all the missing roles at once
+		entry := r.cache.GetRole(roleID)
+		if entry == nil {
+			missing = append(missing, roleID)
+			continue
+		}
+
+		if entry.Role == nil {
+			// this happens when we cache a negative response for the role's existence
+			continue
+		}
+
+		if entry.Age() >= r.config.ACLRoleTTL {
+			expired = append(expired, entry.Role)
+			expCacheMap[roleID] = entry
+		} else {
+			roles = append(roles, entry.Role)
+		}
+	}
+
+	// Hot-path if we have no missing or expired roles
+	if len(missing)+len(expired) == 0 {
+		return roles, nil
+	}
+
+	hasMissing := len(missing) > 0
+
+	fetchIDs := missing
+	for _, role := range expired {
+		fetchIDs = append(fetchIDs, role.ID)
+	}
+
+	waitChan := r.roleGroup.DoChan(identity.SecretToken(), func() (interface{}, error) {
+		roles, err := r.fetchAndCacheRolesForIdentity(identity, fetchIDs, expCacheMap)
+		return roles, err
+	})
+
+	waitForResult := hasMissing || r.config.ACLDownPolicy != "async-cache"
+	if !waitForResult {
+		// waitForResult being false requires that all the roles were cached already
+		roles = append(roles, expired...)
+		return roles, nil
+	}
+
+	res := <-waitChan
+
+	if res.Err != nil {
+		return nil, res.Err
+	}
+
+	if res.Val != nil {
+		foundRoles := res.Val.(map[string]*structs.ACLRole)
+
+		for _, role := range foundRoles {
+			roles = append(roles, role)
+		}
+	}
+
+	return roles, nil
+}
+
+func (r *ACLResolver) resolveTokenToPolicies(token string) (structs.ACLPolicies, error) {
+	_, policies, err := r.resolveTokenToIdentityAndPolicies(token)
+	return policies, err
+}
+
+func (r *ACLResolver) resolveTokenToIdentityAndPolicies(token string) (structs.ACLIdentity, structs.ACLPolicies, error) {
+	var lastErr error
+	var lastIdentity structs.ACLIdentity
+
+	for i := 0; i < tokenPolicyResolutionMaxRetries; i++ {
+		// Resolve the token to an ACLIdentity
+		identity, err := r.resolveIdentityFromToken(token)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
+		} else if identity == nil {
+			return nil, nil, acl.ErrNotFound
+		} else if identity.IsExpired(time.Now()) {
+			return nil, nil, acl.ErrNotFound
 		}
 
-		// Cache the policy
-		c.policies.Add(p.ETag, acl)
-		compiled = acl
+		lastIdentity = identity
+
+		policies, err := r.resolvePoliciesForIdentity(identity)
+		if err == nil {
+			return identity, policies, nil
+		}
+		lastErr = err
+
+		if tokenErr, ok := err.(*policyOrRoleTokenError); ok {
+			if acl.IsErrNotFound(err) && tokenErr.token == identity.SecretToken() {
+				// token was deleted while resolving policies
+				return nil, nil, acl.ErrNotFound
+			}
+
+			// other types of policyOrRoleTokenErrors should cause retrying the whole token
+			// resolution process
+		} else {
+			return identity, nil, err
+		}
 	}
 
-	// Cache the ACL
-	cached = &aclCacheEntry{
-		ACL:  compiled,
-		ETag: p.ETag,
+	return lastIdentity, nil, lastErr
+}
+
+func (r *ACLResolver) resolveTokenToIdentityAndRoles(token string) (structs.ACLIdentity, structs.ACLRoles, error) {
+	var lastErr error
+	var lastIdentity structs.ACLIdentity
+
+	for i := 0; i < tokenRoleResolutionMaxRetries; i++ {
+		// Resolve the token to an ACLIdentity
+		identity, err := r.resolveIdentityFromToken(token)
+		if err != nil {
+			return nil, nil, err
+		} else if identity == nil {
+			return nil, nil, acl.ErrNotFound
+		} else if identity.IsExpired(time.Now()) {
+			return nil, nil, acl.ErrNotFound
+		}
+
+		lastIdentity = identity
+
+		roles, err := r.resolveRolesForIdentity(identity)
+		if err == nil {
+			return identity, roles, nil
+		}
+		lastErr = err
+
+		if tokenErr, ok := err.(*policyOrRoleTokenError); ok {
+			if acl.IsErrNotFound(err) && tokenErr.token == identity.SecretToken() {
+				// token was deleted while resolving roles
+				return nil, nil, acl.ErrNotFound
+			}
+
+			// other types of policyOrRoleTokenErrors should cause retrying the whole token
+			// resolution process
+		} else {
+			return identity, nil, err
+		}
 	}
-	if p.TTL > 0 {
-		cached.Expires = time.Now().Add(p.TTL)
+
+	return lastIdentity, nil, lastErr
+}
+
+func (r *ACLResolver) disableACLsWhenUpstreamDisabled(err error) error {
+	if !r.autoDisable || err == nil || !acl.IsErrDisabled(err) {
+		return err
 	}
-	c.acls.Add(id, cached)
-	return compiled, nil
+
+	r.logger.Printf("[DEBUG] acl: ACLs disabled on upstream servers, will check again after %s", r.config.ACLDisabledTTL)
+	r.disabledLock.Lock()
+	r.disabled = time.Now().Add(r.config.ACLDisabledTTL)
+	r.disabledLock.Unlock()
+
+	return err
+}
+
+func (r *ACLResolver) ResolveToken(token string) (acl.Authorizer, error) {
+	if !r.ACLsEnabled() {
+		return nil, nil
+	}
+
+	if acl.RootAuthorizer(token) != nil {
+		return nil, acl.ErrRootDenied
+	}
+
+	// handle the anonymous token
+	if token == "" {
+		token = anonymousToken
+	}
+
+	if r.delegate.UseLegacyACLs() {
+		authorizer, err := r.resolveTokenLegacy(token)
+		return authorizer, r.disableACLsWhenUpstreamDisabled(err)
+	}
+
+	defer metrics.MeasureSince([]string{"acl", "ResolveToken"}, time.Now())
+
+	policies, err := r.resolveTokenToPolicies(token)
+	if err != nil {
+		r.disableACLsWhenUpstreamDisabled(err)
+		if IsACLRemoteError(err) {
+			r.logger.Printf("[ERR] consul.acl: %v", err)
+			return r.down, nil
+		}
+
+		return nil, err
+	}
+
+	// Build the Authorizer
+	authorizer, err := policies.Compile(acl.RootAuthorizer(r.config.ACLDefaultPolicy), r.cache, r.sentinel)
+	return authorizer, err
+
+}
+
+func (r *ACLResolver) ACLsEnabled() bool {
+	// Whether we desire ACLs to be enabled according to configuration
+	if !r.delegate.ACLsEnabled() {
+		return false
+	}
+
+	if r.autoDisable {
+		// Whether ACLs are disabled according to RPCs failing with a ACLs Disabled error
+		r.disabledLock.RLock()
+		defer r.disabledLock.RUnlock()
+		return !time.Now().Before(r.disabled)
+	}
+
+	return true
+}
+
+func (r *ACLResolver) GetMergedPolicyForToken(token string) (*acl.Policy, error) {
+	policies, err := r.resolveTokenToPolicies(token)
+	if err != nil {
+		return nil, err
+	}
+	if len(policies) == 0 {
+		return nil, acl.ErrNotFound
+	}
+
+	return policies.Merge(r.cache, r.sentinel)
 }
 
 // aclFilter is used to filter results from our state store based on ACL rules
 // configured for the provided token.
 type aclFilter struct {
-	acl             acl.ACL
+	authorizer      acl.Authorizer
 	logger          *log.Logger
 	enforceVersion8 bool
 }
 
 // newACLFilter constructs a new aclFilter.
-func newACLFilter(acl acl.ACL, logger *log.Logger, enforceVersion8 bool) *aclFilter {
+func newACLFilter(authorizer acl.Authorizer, logger *log.Logger, enforceVersion8 bool) *aclFilter {
 	if logger == nil {
-		logger = log.New(os.Stdout, "", log.LstdFlags)
+		logger = log.New(os.Stderr, "", log.LstdFlags)
 	}
 	return &aclFilter{
-		acl:             acl,
+		authorizer:      authorizer,
 		logger:          logger,
 		enforceVersion8: enforceVersion8,
 	}
@@ -332,7 +1063,7 @@ func (f *aclFilter) allowNode(node string) bool {
 	if !f.enforceVersion8 {
 		return true
 	}
-	return f.acl.NodeRead(node)
+	return f.authorizer.NodeRead(node)
 }
 
 // allowService is used to determine if a service is accessible for an ACL.
@@ -341,11 +1072,10 @@ func (f *aclFilter) allowService(service string) bool {
 		return true
 	}
 
-	if !f.enforceVersion8 && service == ConsulServiceID {
+	if !f.enforceVersion8 && service == structs.ConsulServiceID {
 		return true
 	}
-
-	return f.acl.ServiceRead(service)
+	return f.authorizer.ServiceRead(service)
 }
 
 // allowSession is used to determine if a session for a node is accessible for
@@ -354,7 +1084,7 @@ func (f *aclFilter) allowSession(node string) bool {
 	if !f.enforceVersion8 {
 		return true
 	}
-	return f.acl.SessionRead(node)
+	return f.authorizer.SessionRead(node)
 }
 
 // filterHealthChecks is used to filter a set of health checks down based on
@@ -466,6 +1196,33 @@ func (f *aclFilter) filterCoordinates(coords *structs.Coordinates) {
 	*coords = c
 }
 
+// filterIntentions is used to filter intentions based on ACL rules.
+// We prune entries the user doesn't have access to, and we redact any tokens
+// if the user doesn't have a management token.
+func (f *aclFilter) filterIntentions(ixns *structs.Intentions) {
+	// Management tokens can see everything with no filtering.
+	if f.authorizer.ACLRead() {
+		return
+	}
+
+	// Otherwise, we need to see what the token has access to.
+	ret := make(structs.Intentions, 0, len(*ixns))
+	for _, ixn := range *ixns {
+		// If no prefix ACL applies to this then filter it, since
+		// we know at this point the user doesn't have a management
+		// token, otherwise see what the policy says.
+		prefix, ok := ixn.GetACLPrefix()
+		if !ok || !f.authorizer.IntentionRead(prefix) {
+			f.logger.Printf("[DEBUG] consul: dropping intention %q from result due to ACLs", ixn.ID)
+			continue
+		}
+
+		ret = append(ret, ixn)
+	}
+
+	*ixns = ret
+}
+
 // filterNodeDump is used to filter through all parts of a node dump and
 // remove elements the provided ACL token cannot access.
 func (f *aclFilter) filterNodeDump(dump *structs.NodeDump) {
@@ -530,7 +1287,7 @@ func (f *aclFilter) filterNodes(nodes *structs.Nodes) {
 // captured tokens, but they can at least see whether or not a token is set.
 func (f *aclFilter) redactPreparedQueryTokens(query **structs.PreparedQuery) {
 	// Management tokens can see everything with no filtering.
-	if f.acl.ACLList() {
+	if f.authorizer.ACLWrite() {
 		return
 	}
 
@@ -555,7 +1312,7 @@ func (f *aclFilter) redactPreparedQueryTokens(query **structs.PreparedQuery) {
 // if the user doesn't have a management token.
 func (f *aclFilter) filterPreparedQueries(queries *structs.PreparedQueries) {
 	// Management tokens can see everything with no filtering.
-	if f.acl.ACLList() {
+	if f.authorizer.ACLWrite() {
 		return
 	}
 
@@ -566,7 +1323,7 @@ func (f *aclFilter) filterPreparedQueries(queries *structs.PreparedQueries) {
 		// we know at this point the user doesn't have a management
 		// token, otherwise see what the policy says.
 		prefix, ok := query.GetACLPrefix()
-		if !ok || !f.acl.PreparedQueryRead(prefix) {
+		if !ok || !f.authorizer.PreparedQueryRead(prefix) {
 			f.logger.Printf("[DEBUG] consul: dropping prepared query %q from result due to ACLs", query.ID)
 			continue
 		}
@@ -580,23 +1337,31 @@ func (f *aclFilter) filterPreparedQueries(queries *structs.PreparedQueries) {
 	*queries = ret
 }
 
-// filterACL is used to filter results from our service catalog based on the
-// rules configured for the provided token. The subject is scrubbed and
-// modified in-place, leaving only resources the token can access.
-func (s *Server) filterACL(token string, subj interface{}) error {
-	// Get the ACL from the token
-	acl, err := s.resolveToken(token)
-	if err != nil {
-		return err
+func (f *aclFilter) redactTokenSecret(token **structs.ACLToken) {
+	if token == nil || *token == nil || f == nil || f.authorizer.ACLWrite() {
+		return
 	}
+	clone := *(*token)
+	clone.SecretID = redactedToken
+	*token = &clone
+}
 
-	// Fast path if ACLs are not enabled
-	if acl == nil {
+func (f *aclFilter) redactTokenSecrets(tokens *structs.ACLTokens) {
+	ret := make(structs.ACLTokens, 0, len(*tokens))
+	for _, token := range *tokens {
+		final := token
+		f.redactTokenSecret(&final)
+		ret = append(ret, final)
+	}
+	*tokens = ret
+}
+
+func (r *ACLResolver) filterACLWithAuthorizer(authorizer acl.Authorizer, subj interface{}) error {
+	if authorizer == nil {
 		return nil
 	}
-
 	// Create the filter
-	filt := newACLFilter(acl, s.logger, s.config.ACLEnforceVersion8)
+	filt := newACLFilter(authorizer, r.logger, r.config.ACLEnforceVersion8)
 
 	switch v := subj.(type) {
 	case *structs.CheckServiceNodes:
@@ -610,6 +1375,9 @@ func (s *Server) filterACL(token string, subj interface{}) error {
 
 	case *structs.IndexedHealthChecks:
 		filt.filterHealthChecks(&v.HealthChecks)
+
+	case *structs.IndexedIntentions:
+		filt.filterIntentions(&v.Intentions)
 
 	case *structs.IndexedNodeDump:
 		filt.filterNodeDump(&v.Dump)
@@ -635,11 +1403,34 @@ func (s *Server) filterACL(token string, subj interface{}) error {
 	case **structs.PreparedQuery:
 		filt.redactPreparedQueryTokens(v)
 
+	case *structs.ACLTokens:
+		filt.redactTokenSecrets(v)
+
+	case **structs.ACLToken:
+		filt.redactTokenSecret(v)
+
 	default:
 		panic(fmt.Errorf("Unhandled type passed to ACL filter: %#v", subj))
 	}
 
 	return nil
+}
+
+// filterACL is used to filter results from our service catalog based on the
+// rules configured for the provided token.
+func (r *ACLResolver) filterACL(token string, subj interface{}) error {
+	// Get the ACL from the token
+	authorizer, err := r.ResolveToken(token)
+	if err != nil {
+		return err
+	}
+
+	// Fast path if ACLs are not enabled
+	if authorizer == nil {
+		return nil
+	}
+
+	return r.filterACLWithAuthorizer(authorizer, subj)
 }
 
 // vetRegisterWithACL applies the given ACL's policy to the catalog update and
@@ -656,33 +1447,72 @@ func (s *Server) filterACL(token string, subj interface{}) error {
 // address this race better (even then it would be super rare, and would at
 // worst let a service update revert a recent node update, so it doesn't open up
 // too much abuse).
-func vetRegisterWithACL(acl acl.ACL, subj *structs.RegisterRequest,
+func vetRegisterWithACL(rule acl.Authorizer, subj *structs.RegisterRequest,
 	ns *structs.NodeServices) error {
 	// Fast path if ACLs are not enabled.
-	if acl == nil {
+	if rule == nil {
 		return nil
+	}
+
+	// This gets called potentially from a few spots so we save it and
+	// return the structure we made if we have it.
+	var memo map[string]interface{}
+	scope := func() map[string]interface{} {
+		if memo != nil {
+			return memo
+		}
+
+		node := &api.Node{
+			ID:              string(subj.ID),
+			Node:            subj.Node,
+			Address:         subj.Address,
+			Datacenter:      subj.Datacenter,
+			TaggedAddresses: subj.TaggedAddresses,
+			Meta:            subj.NodeMeta,
+		}
+
+		var service *api.AgentService
+		if subj.Service != nil {
+			service = &api.AgentService{
+				ID:                subj.Service.ID,
+				Service:           subj.Service.Service,
+				Tags:              subj.Service.Tags,
+				Meta:              subj.Service.Meta,
+				Address:           subj.Service.Address,
+				Port:              subj.Service.Port,
+				EnableTagOverride: subj.Service.EnableTagOverride,
+			}
+		}
+
+		memo = sentinel.ScopeCatalogUpsert(node, service)
+		return memo
 	}
 
 	// Vet the node info. This allows service updates to re-post the required
 	// node info for each request without having to have node "write"
 	// privileges.
 	needsNode := ns == nil || subj.ChangesNode(ns.Node)
-	if needsNode && !acl.NodeWrite(subj.Node) {
-		return errPermissionDenied
+
+	if needsNode && !rule.NodeWrite(subj.Node, scope) {
+		return acl.ErrPermissionDenied
 	}
 
 	// Vet the service change. This includes making sure they can register
 	// the given service, and that we can write to any existing service that
 	// is being modified by id (if any).
 	if subj.Service != nil {
-		if !acl.ServiceWrite(subj.Service.Service) {
-			return errPermissionDenied
+		if !rule.ServiceWrite(subj.Service.Service, scope) {
+			return acl.ErrPermissionDenied
 		}
 
 		if ns != nil {
 			other, ok := ns.Services[subj.Service.ID]
-			if ok && !acl.ServiceWrite(other.Service) {
-				return errPermissionDenied
+
+			// This is effectively a delete, so we DO NOT apply the
+			// sentinel scope to the service we are overwriting, just
+			// the regular ACL policy.
+			if ok && !rule.ServiceWrite(other.Service, nil) {
+				return acl.ErrPermissionDenied
 			}
 		}
 	}
@@ -710,8 +1540,8 @@ func vetRegisterWithACL(acl acl.ACL, subj *structs.RegisterRequest,
 
 		// Node-level check.
 		if check.ServiceID == "" {
-			if !acl.NodeWrite(subj.Node) {
-				return errPermissionDenied
+			if !rule.NodeWrite(subj.Node, scope) {
+				return acl.ErrPermissionDenied
 			}
 			continue
 		}
@@ -735,8 +1565,11 @@ func vetRegisterWithACL(acl acl.ACL, subj *structs.RegisterRequest,
 			return fmt.Errorf("Unknown service '%s' for check '%s'", check.ServiceID, check.CheckID)
 		}
 
-		if !acl.ServiceWrite(other.Service) {
-			return errPermissionDenied
+		// We are only adding a check here, so we don't add the scope,
+		// since the sentinel policy doesn't apply to adding checks at
+		// this time.
+		if !rule.ServiceWrite(other.Service, nil) {
+			return acl.ErrPermissionDenied
 		}
 	}
 
@@ -748,39 +1581,155 @@ func vetRegisterWithACL(acl acl.ACL, subj *structs.RegisterRequest,
 // dynamic, this is a pretty complex algorithm and was worth breaking out of the
 // endpoint. The NodeService for the referenced service must be supplied, and can
 // be nil; similar for the HealthCheck for the referenced health check.
-func vetDeregisterWithACL(acl acl.ACL, subj *structs.DeregisterRequest,
+func vetDeregisterWithACL(rule acl.Authorizer, subj *structs.DeregisterRequest,
 	ns *structs.NodeService, nc *structs.HealthCheck) error {
+
 	// Fast path if ACLs are not enabled.
-	if acl == nil {
+	if rule == nil {
 		return nil
 	}
 
-	// This order must match the code in applyRegister() in fsm.go since it
-	// also evaluates things in this order, and will ignore fields based on
-	// this precedence. This lets us also ignore them from an ACL perspective.
+	// We don't apply sentinel in this path, since at this time sentinel
+	// only applies to create and update operations.
+
+	// Allow service deregistration if the token has write permission for the node.
+	// This accounts for cases where the agent no longer has a token with write permission
+	// on the service to deregister it.
+	if rule.NodeWrite(subj.Node, nil) {
+		return nil
+	}
+
+	// This order must match the code in applyDeregister() in
+	// fsm/commands_oss.go since it also evaluates things in this order,
+	// and will ignore fields based on this precedence. This lets us also
+	// ignore them from an ACL perspective.
 	if subj.ServiceID != "" {
 		if ns == nil {
 			return fmt.Errorf("Unknown service '%s'", subj.ServiceID)
 		}
-		if !acl.ServiceWrite(ns.Service) {
-			return errPermissionDenied
+		if !rule.ServiceWrite(ns.Service, nil) {
+			return acl.ErrPermissionDenied
 		}
 	} else if subj.CheckID != "" {
 		if nc == nil {
 			return fmt.Errorf("Unknown check '%s'", subj.CheckID)
 		}
 		if nc.ServiceID != "" {
-			if !acl.ServiceWrite(nc.ServiceName) {
-				return errPermissionDenied
+			if !rule.ServiceWrite(nc.ServiceName, nil) {
+				return acl.ErrPermissionDenied
 			}
 		} else {
-			if !acl.NodeWrite(subj.Node) {
-				return errPermissionDenied
+			if !rule.NodeWrite(subj.Node, nil) {
+				return acl.ErrPermissionDenied
 			}
 		}
 	} else {
-		if !acl.NodeWrite(subj.Node) {
-			return errPermissionDenied
+		// Since NodeWrite is not given - otherwise the earlier check
+		// would've returned already - we can deny here.
+		return acl.ErrPermissionDenied
+	}
+
+	return nil
+}
+
+// vetNodeTxnOp applies the given ACL policy to a node transaction operation.
+func vetNodeTxnOp(op *structs.TxnNodeOp, rule acl.Authorizer) error {
+	// Fast path if ACLs are not enabled.
+	if rule == nil {
+		return nil
+	}
+
+	node := op.Node
+
+	n := &api.Node{
+		Node:            node.Node,
+		ID:              string(node.ID),
+		Address:         node.Address,
+		Datacenter:      node.Datacenter,
+		TaggedAddresses: node.TaggedAddresses,
+		Meta:            node.Meta,
+	}
+
+	// Sentinel doesn't apply to deletes, only creates/updates, so we don't need the scopeFn.
+	var scope func() map[string]interface{}
+	if op.Verb != api.NodeDelete && op.Verb != api.NodeDeleteCAS {
+		scope = func() map[string]interface{} {
+			return sentinel.ScopeCatalogUpsert(n, nil)
+		}
+	}
+
+	if rule != nil && !rule.NodeWrite(node.Node, scope) {
+		return acl.ErrPermissionDenied
+	}
+
+	return nil
+}
+
+// vetServiceTxnOp applies the given ACL policy to a service transaction operation.
+func vetServiceTxnOp(op *structs.TxnServiceOp, rule acl.Authorizer) error {
+	// Fast path if ACLs are not enabled.
+	if rule == nil {
+		return nil
+	}
+
+	service := op.Service
+
+	n := &api.Node{Node: op.Node}
+	svc := &api.AgentService{
+		ID:                service.ID,
+		Service:           service.Service,
+		Tags:              service.Tags,
+		Meta:              service.Meta,
+		Address:           service.Address,
+		Port:              service.Port,
+		EnableTagOverride: service.EnableTagOverride,
+	}
+	var scope func() map[string]interface{}
+	if op.Verb != api.ServiceDelete && op.Verb != api.ServiceDeleteCAS {
+		scope = func() map[string]interface{} {
+			return sentinel.ScopeCatalogUpsert(n, svc)
+		}
+	}
+	if !rule.ServiceWrite(service.Service, scope) {
+		return acl.ErrPermissionDenied
+	}
+
+	return nil
+}
+
+// vetCheckTxnOp applies the given ACL policy to a check transaction operation.
+func vetCheckTxnOp(op *structs.TxnCheckOp, rule acl.Authorizer) error {
+	// Fast path if ACLs are not enabled.
+	if rule == nil {
+		return nil
+	}
+
+	n := &api.Node{Node: op.Check.Node}
+	svc := &api.AgentService{
+		ID:      op.Check.ServiceID,
+		Service: op.Check.ServiceID,
+		Tags:    op.Check.ServiceTags,
+	}
+	var scope func() map[string]interface{}
+	if op.Check.ServiceID == "" {
+		// Node-level check.
+		if op.Verb == api.CheckDelete || op.Verb == api.CheckDeleteCAS {
+			scope = func() map[string]interface{} {
+				return sentinel.ScopeCatalogUpsert(n, svc)
+			}
+		}
+		if !rule.NodeWrite(op.Check.Node, scope) {
+			return acl.ErrPermissionDenied
+		}
+	} else {
+		// Service-level check.
+		if op.Verb == api.CheckDelete || op.Verb == api.CheckDeleteCAS {
+			scope = func() map[string]interface{} {
+				return sentinel.ScopeCatalogUpsert(n, svc)
+			}
+		}
+		if !rule.ServiceWrite(op.Check.ServiceName, scope) {
+			return acl.ErrPermissionDenied
 		}
 	}
 

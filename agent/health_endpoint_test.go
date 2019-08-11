@@ -6,19 +6,23 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"testing"
 
-	"github.com/hashicorp/consul/agent/consul/structs"
+	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
-	"github.com/hashicorp/consul/testutil/retry"
+	"github.com/hashicorp/consul/sdk/testutil/retry"
+	"github.com/hashicorp/consul/testrpc"
 	"github.com/hashicorp/serf/coordinate"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestHealthChecksInState(t *testing.T) {
 	t.Parallel()
 	t.Run("warning", func(t *testing.T) {
-		a := NewTestAgent(t.Name(), nil)
+		a := NewTestAgent(t, t.Name(), "")
 		defer a.Shutdown()
 
 		req, _ := http.NewRequest("GET", "/v1/health/state/warning?dc=dc1", nil)
@@ -41,7 +45,7 @@ func TestHealthChecksInState(t *testing.T) {
 	})
 
 	t.Run("passing", func(t *testing.T) {
-		a := NewTestAgent(t.Name(), nil)
+		a := NewTestAgent(t, t.Name(), "")
 		defer a.Shutdown()
 
 		req, _ := http.NewRequest("GET", "/v1/health/state/passing?dc=dc1", nil)
@@ -66,7 +70,7 @@ func TestHealthChecksInState(t *testing.T) {
 
 func TestHealthChecksInState_NodeMetaFilter(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	args := &structs.RegisterRequest{
@@ -104,9 +108,55 @@ func TestHealthChecksInState_NodeMetaFilter(t *testing.T) {
 	})
 }
 
+func TestHealthChecksInState_Filter(t *testing.T) {
+	t.Parallel()
+	a := NewTestAgent(t, t.Name(), "")
+	defer a.Shutdown()
+
+	args := &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "bar",
+		Address:    "127.0.0.1",
+		NodeMeta:   map[string]string{"somekey": "somevalue"},
+		Check: &structs.HealthCheck{
+			Node:   "bar",
+			Name:   "node check",
+			Status: api.HealthCritical,
+		},
+	}
+	var out struct{}
+	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+
+	args = &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "bar",
+		Address:    "127.0.0.1",
+		NodeMeta:   map[string]string{"somekey": "somevalue"},
+		Check: &structs.HealthCheck{
+			Node:   "bar",
+			Name:   "node check 2",
+			Status: api.HealthCritical,
+		},
+		SkipNodeUpdate: true,
+	}
+	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+
+	req, _ := http.NewRequest("GET", "/v1/health/state/critical?filter="+url.QueryEscape("Name == `node check 2`"), nil)
+	retry.Run(t, func(r *retry.R) {
+		resp := httptest.NewRecorder()
+		obj, err := a.srv.HealthChecksInState(resp, req)
+		require.NoError(r, err)
+		require.NoError(r, checkIndex(resp))
+
+		// Should be 1 health check for the server
+		nodes := obj.(structs.HealthChecks)
+		require.Len(r, nodes, 1)
+	})
+}
+
 func TestHealthChecksInState_DistanceSort(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	args := &structs.RegisterRequest{
@@ -180,8 +230,9 @@ func TestHealthChecksInState_DistanceSort(t *testing.T) {
 
 func TestHealthNodeChecks(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
 	req, _ := http.NewRequest("GET", "/v1/health/node/nope?dc=dc1", nil)
 	resp := httptest.NewRecorder()
@@ -212,10 +263,55 @@ func TestHealthNodeChecks(t *testing.T) {
 	}
 }
 
+func TestHealthNodeChecks_Filtering(t *testing.T) {
+	t.Parallel()
+	a := NewTestAgent(t, t.Name(), "")
+	defer a.Shutdown()
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
+
+	// Create a node check
+	args := &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "test-health-node",
+		Address:    "127.0.0.2",
+		Check: &structs.HealthCheck{
+			Node: "test-health-node",
+			Name: "check1",
+		},
+	}
+
+	var out struct{}
+	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+
+	// Create a second check
+	args = &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "test-health-node",
+		Address:    "127.0.0.2",
+		Check: &structs.HealthCheck{
+			Node: "test-health-node",
+			Name: "check2",
+		},
+		SkipNodeUpdate: true,
+	}
+	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+
+	req, _ := http.NewRequest("GET", "/v1/health/node/test-health-node?filter="+url.QueryEscape("Name == check2"), nil)
+	resp := httptest.NewRecorder()
+	obj, err := a.srv.HealthNodeChecks(resp, req)
+	require.NoError(t, err)
+	assertIndex(t, resp)
+
+	// Should be 1 health check for the server
+	nodes := obj.(structs.HealthChecks)
+	require.Len(t, nodes, 1)
+}
+
 func TestHealthServiceChecks(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
 	req, _ := http.NewRequest("GET", "/v1/health/checks/consul?dc=dc1", nil)
 	resp := httptest.NewRecorder()
@@ -265,8 +361,9 @@ func TestHealthServiceChecks(t *testing.T) {
 
 func TestHealthServiceChecks_NodeMetaFilter(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
 	req, _ := http.NewRequest("GET", "/v1/health/checks/consul?dc=dc1&node-meta=somekey:somevalue", nil)
 	resp := httptest.NewRecorder()
@@ -315,10 +412,72 @@ func TestHealthServiceChecks_NodeMetaFilter(t *testing.T) {
 	}
 }
 
+func TestHealthServiceChecks_Filtering(t *testing.T) {
+	t.Parallel()
+	a := NewTestAgent(t, t.Name(), "")
+	defer a.Shutdown()
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
+
+	req, _ := http.NewRequest("GET", "/v1/health/checks/consul?dc=dc1&node-meta=somekey:somevalue", nil)
+	resp := httptest.NewRecorder()
+	obj, err := a.srv.HealthServiceChecks(resp, req)
+	require.NoError(t, err)
+	assertIndex(t, resp)
+
+	// Should be a non-nil empty list
+	nodes := obj.(structs.HealthChecks)
+	require.Empty(t, nodes)
+
+	args := &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       a.Config.NodeName,
+		Address:    "127.0.0.1",
+		NodeMeta:   map[string]string{"somekey": "somevalue"},
+		Check: &structs.HealthCheck{
+			Node:      a.Config.NodeName,
+			Name:      "consul check",
+			ServiceID: "consul",
+		},
+		SkipNodeUpdate: true,
+	}
+
+	var out struct{}
+	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+
+	// Create a new node, service and check
+	args = &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "test-health-node",
+		Address:    "127.0.0.2",
+		NodeMeta:   map[string]string{"somekey": "somevalue"},
+		Service: &structs.NodeService{
+			ID:      "consul",
+			Service: "consul",
+		},
+		Check: &structs.HealthCheck{
+			Node:      "test-health-node",
+			Name:      "consul check",
+			ServiceID: "consul",
+		},
+	}
+	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+
+	req, _ = http.NewRequest("GET", "/v1/health/checks/consul?dc=dc1&filter="+url.QueryEscape("Node == `test-health-node`"), nil)
+	resp = httptest.NewRecorder()
+	obj, err = a.srv.HealthServiceChecks(resp, req)
+	require.NoError(t, err)
+	assertIndex(t, resp)
+
+	// Should be 1 health check for consul
+	nodes = obj.(structs.HealthChecks)
+	require.Len(t, nodes, 1)
+}
+
 func TestHealthServiceChecks_DistanceSort(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
 	// Create a service check
 	args := &structs.RegisterRequest{
@@ -396,8 +555,12 @@ func TestHealthServiceChecks_DistanceSort(t *testing.T) {
 
 func TestHealthServiceNodes(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
+
+	assert := assert.New(t)
+	require := require.New(t)
 
 	req, _ := http.NewRequest("GET", "/v1/health/service/consul?dc=dc1", nil)
 	resp := httptest.NewRecorder()
@@ -458,12 +621,69 @@ func TestHealthServiceNodes(t *testing.T) {
 	if len(nodes) != 1 || nodes[0].Checks == nil || len(nodes[0].Checks) != 0 {
 		t.Fatalf("bad: %v", obj)
 	}
+
+	// Test caching
+	{
+		// List instances with cache enabled
+		req, _ := http.NewRequest("GET", "/v1/health/service/test?cached", nil)
+		resp := httptest.NewRecorder()
+		obj, err := a.srv.HealthServiceNodes(resp, req)
+		require.NoError(err)
+		nodes := obj.(structs.CheckServiceNodes)
+		assert.Len(nodes, 1)
+
+		// Should be a cache miss
+		assert.Equal("MISS", resp.Header().Get("X-Cache"))
+	}
+
+	{
+		// List instances with cache enabled
+		req, _ := http.NewRequest("GET", "/v1/health/service/test?cached", nil)
+		resp := httptest.NewRecorder()
+		obj, err := a.srv.HealthServiceNodes(resp, req)
+		require.NoError(err)
+		nodes := obj.(structs.CheckServiceNodes)
+		assert.Len(nodes, 1)
+
+		// Should be a cache HIT now!
+		assert.Equal("HIT", resp.Header().Get("X-Cache"))
+	}
+
+	// Ensure background refresh works
+	{
+		// Register a new instance of the service
+		args2 := args
+		args2.Node = "baz"
+		args2.Address = "127.0.0.2"
+		require.NoError(a.RPC("Catalog.Register", args, &out))
+
+		retry.Run(t, func(r *retry.R) {
+			// List it again
+			req, _ := http.NewRequest("GET", "/v1/health/service/test?cached", nil)
+			resp := httptest.NewRecorder()
+			obj, err := a.srv.HealthServiceNodes(resp, req)
+			r.Check(err)
+
+			nodes := obj.(structs.CheckServiceNodes)
+			if len(nodes) != 2 {
+				r.Fatalf("Want 2 nodes")
+			}
+
+			// Should be a cache hit! The data should've updated in the cache
+			// in the background so this should've been fetched directly from
+			// the cache.
+			if resp.Header().Get("X-Cache") != "HIT" {
+				r.Fatalf("should be a cache hit")
+			}
+		})
+	}
 }
 
 func TestHealthServiceNodes_NodeMetaFilter(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
+	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
 	req, _ := http.NewRequest("GET", "/v1/health/service/consul?dc=dc1&node-meta=somekey:somevalue", nil)
 	resp := httptest.NewRecorder()
@@ -512,14 +732,76 @@ func TestHealthServiceNodes_NodeMetaFilter(t *testing.T) {
 	}
 }
 
-func TestHealthServiceNodes_DistanceSort(t *testing.T) {
+func TestHealthServiceNodes_Filter(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
+	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
-	// Create a service check
+	req, _ := http.NewRequest("GET", "/v1/health/service/consul?dc=dc1&filter="+url.QueryEscape("Node.Node == `test-health-node`"), nil)
+	resp := httptest.NewRecorder()
+	obj, err := a.srv.HealthServiceNodes(resp, req)
+	require.NoError(t, err)
+	assertIndex(t, resp)
+
+	// Should be a non-nil empty list
+	nodes := obj.(structs.CheckServiceNodes)
+	require.Empty(t, nodes)
+
 	args := &structs.RegisterRequest{
 		Datacenter: "dc1",
+		Node:       a.Config.NodeName,
+		Address:    "127.0.0.1",
+		NodeMeta:   map[string]string{"somekey": "somevalue"},
+		Check: &structs.HealthCheck{
+			Node:      a.Config.NodeName,
+			Name:      "consul check",
+			ServiceID: "consul",
+		},
+	}
+
+	var out struct{}
+	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+
+	// Create a new node, service and check
+	args = &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "test-health-node",
+		Address:    "127.0.0.2",
+		NodeMeta:   map[string]string{"somekey": "somevalue"},
+		Service: &structs.NodeService{
+			ID:      "consul",
+			Service: "consul",
+		},
+		Check: &structs.HealthCheck{
+			Node:      "test-health-node",
+			Name:      "consul check",
+			ServiceID: "consul",
+		},
+	}
+	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+
+	req, _ = http.NewRequest("GET", "/v1/health/service/consul?dc=dc1&filter="+url.QueryEscape("Node.Node == `test-health-node`"), nil)
+	resp = httptest.NewRecorder()
+	obj, err = a.srv.HealthServiceNodes(resp, req)
+	require.NoError(t, err)
+
+	assertIndex(t, resp)
+
+	// Should be a non-nil empty list for checks
+	nodes = obj.(structs.CheckServiceNodes)
+	require.Len(t, nodes, 1)
+	require.Len(t, nodes[0].Checks, 1)
+}
+
+func TestHealthServiceNodes_DistanceSort(t *testing.T) {
+	t.Parallel()
+	a := NewTestAgent(t, t.Name(), "")
+	defer a.Shutdown()
+	dc := "dc1"
+	// Create a service check
+	args := &structs.RegisterRequest{
+		Datacenter: dc,
 		Node:       "bar",
 		Address:    "127.0.0.1",
 		Service: &structs.NodeService{
@@ -532,7 +814,7 @@ func TestHealthServiceNodes_DistanceSort(t *testing.T) {
 			ServiceID: "test",
 		},
 	}
-
+	testrpc.WaitForLeader(t, a.RPC, dc)
 	var out struct{}
 	if err := a.RPC("Catalog.Register", args, &out); err != nil {
 		t.Fatalf("err: %v", err)
@@ -593,12 +875,13 @@ func TestHealthServiceNodes_DistanceSort(t *testing.T) {
 
 func TestHealthServiceNodes_PassingFilter(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
+	dc := "dc1"
 	// Create a failing service check
 	args := &structs.RegisterRequest{
-		Datacenter: "dc1",
+		Datacenter: dc,
 		Node:       a.Config.NodeName,
 		Address:    "127.0.0.1",
 		Check: &structs.HealthCheck{
@@ -609,10 +892,12 @@ func TestHealthServiceNodes_PassingFilter(t *testing.T) {
 		},
 	}
 
-	var out struct{}
-	if err := a.RPC("Catalog.Register", args, &out); err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	retry.Run(t, func(r *retry.R) {
+		var out struct{}
+		if err := a.RPC("Catalog.Register", args, &out); err != nil {
+			r.Fatalf("err: %v", err)
+		}
+	})
 
 	t.Run("bc_no_query_value", func(t *testing.T) {
 		req, _ := http.NewRequest("GET", "/v1/health/service/consul?passing", nil)
@@ -687,22 +972,24 @@ func TestHealthServiceNodes_PassingFilter(t *testing.T) {
 
 func TestHealthServiceNodes_WanTranslation(t *testing.T) {
 	t.Parallel()
-	cfg1 := TestConfig()
-	cfg1.Datacenter = "dc1"
-	cfg1.TranslateWanAddrs = true
-	cfg1.ACLDatacenter = ""
-	a1 := NewTestAgent(t.Name(), cfg1)
+	a1 := NewTestAgent(t, t.Name(), `
+		datacenter = "dc1"
+		translate_wan_addrs = true
+		acl_datacenter = ""
+	`)
 	defer a1.Shutdown()
+	testrpc.WaitForLeader(t, a1.RPC, "dc1")
 
-	cfg2 := TestConfig()
-	cfg2.Datacenter = "dc2"
-	cfg2.TranslateWanAddrs = true
-	cfg2.ACLDatacenter = ""
-	a2 := NewTestAgent(t.Name(), cfg2)
+	a2 := NewTestAgent(t, t.Name(), `
+		datacenter = "dc2"
+		translate_wan_addrs = true
+		acl_datacenter = ""
+	`)
 	defer a2.Shutdown()
+	testrpc.WaitForLeader(t, a2.RPC, "dc2")
 
 	// Wait for the WAN join.
-	addr := fmt.Sprintf("127.0.0.1:%d", a1.Config.Ports.SerfWan)
+	addr := fmt.Sprintf("127.0.0.1:%d", a1.Config.SerfPortWAN)
 	if _, err := a2.JoinWAN([]string{addr}); err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -768,6 +1055,143 @@ func TestHealthServiceNodes_WanTranslation(t *testing.T) {
 	if node2.Address != "127.0.0.1" {
 		t.Fatalf("bad: %v", node2)
 	}
+}
+
+func TestHealthConnectServiceNodes(t *testing.T) {
+	t.Parallel()
+
+	assert := assert.New(t)
+	a := NewTestAgent(t, t.Name(), "")
+	defer a.Shutdown()
+
+	// Register
+	args := structs.TestRegisterRequestProxy(t)
+	var out struct{}
+	assert.Nil(a.RPC("Catalog.Register", args, &out))
+
+	// Request
+	req, _ := http.NewRequest("GET", fmt.Sprintf(
+		"/v1/health/connect/%s?dc=dc1", args.Service.Proxy.DestinationServiceName), nil)
+	resp := httptest.NewRecorder()
+	obj, err := a.srv.HealthConnectServiceNodes(resp, req)
+	assert.Nil(err)
+	assertIndex(t, resp)
+
+	// Should be a non-nil empty list for checks
+	nodes := obj.(structs.CheckServiceNodes)
+	assert.Len(nodes, 1)
+	assert.Len(nodes[0].Checks, 0)
+}
+
+func TestHealthConnectServiceNodes_Filter(t *testing.T) {
+	t.Parallel()
+
+	a := NewTestAgent(t, t.Name(), "")
+	defer a.Shutdown()
+	testrpc.WaitForLeader(t, a.RPC, "dc1")
+
+	// Register
+	args := structs.TestRegisterRequestProxy(t)
+	args.Service.Address = "127.0.0.55"
+	var out struct{}
+	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+
+	args = structs.TestRegisterRequestProxy(t)
+	args.Service.Address = "127.0.0.55"
+	args.Service.Meta = map[string]string{
+		"version": "2",
+	}
+	args.Service.ID = "web-proxy2"
+	args.SkipNodeUpdate = true
+	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf(
+		"/v1/health/connect/%s?filter=%s",
+		args.Service.Proxy.DestinationServiceName,
+		url.QueryEscape("Service.Meta.version == 2")), nil)
+	resp := httptest.NewRecorder()
+	obj, err := a.srv.HealthConnectServiceNodes(resp, req)
+	require.NoError(t, err)
+	assertIndex(t, resp)
+
+	nodes := obj.(structs.CheckServiceNodes)
+	require.Len(t, nodes, 1)
+	require.Equal(t, structs.ServiceKindConnectProxy, nodes[0].Service.Kind)
+	require.Equal(t, args.Service.Address, nodes[0].Service.Address)
+	require.Equal(t, args.Service.Proxy, nodes[0].Service.Proxy)
+}
+
+func TestHealthConnectServiceNodes_PassingFilter(t *testing.T) {
+	t.Parallel()
+
+	a := NewTestAgent(t, t.Name(), "")
+	defer a.Shutdown()
+
+	// Register
+	args := structs.TestRegisterRequestProxy(t)
+	args.Check = &structs.HealthCheck{
+		Node:      args.Node,
+		Name:      "check",
+		ServiceID: args.Service.Service,
+		Status:    api.HealthCritical,
+	}
+	var out struct{}
+	assert.Nil(t, a.RPC("Catalog.Register", args, &out))
+
+	t.Run("bc_no_query_value", func(t *testing.T) {
+		assert := assert.New(t)
+		req, _ := http.NewRequest("GET", fmt.Sprintf(
+			"/v1/health/connect/%s?passing", args.Service.Proxy.DestinationServiceName), nil)
+		resp := httptest.NewRecorder()
+		obj, err := a.srv.HealthConnectServiceNodes(resp, req)
+		assert.Nil(err)
+		assertIndex(t, resp)
+
+		// Should be 0 health check for consul
+		nodes := obj.(structs.CheckServiceNodes)
+		assert.Len(nodes, 0)
+	})
+
+	t.Run("passing_true", func(t *testing.T) {
+		assert := assert.New(t)
+		req, _ := http.NewRequest("GET", fmt.Sprintf(
+			"/v1/health/connect/%s?passing=true", args.Service.Proxy.DestinationServiceName), nil)
+		resp := httptest.NewRecorder()
+		obj, err := a.srv.HealthConnectServiceNodes(resp, req)
+		assert.Nil(err)
+		assertIndex(t, resp)
+
+		// Should be 0 health check for consul
+		nodes := obj.(structs.CheckServiceNodes)
+		assert.Len(nodes, 0)
+	})
+
+	t.Run("passing_false", func(t *testing.T) {
+		assert := assert.New(t)
+		req, _ := http.NewRequest("GET", fmt.Sprintf(
+			"/v1/health/connect/%s?passing=false", args.Service.Proxy.DestinationServiceName), nil)
+		resp := httptest.NewRecorder()
+		obj, err := a.srv.HealthConnectServiceNodes(resp, req)
+		assert.Nil(err)
+		assertIndex(t, resp)
+
+		// Should be 1
+		nodes := obj.(structs.CheckServiceNodes)
+		assert.Len(nodes, 1)
+	})
+
+	t.Run("passing_bad", func(t *testing.T) {
+		assert := assert.New(t)
+		req, _ := http.NewRequest("GET", fmt.Sprintf(
+			"/v1/health/connect/%s?passing=nope-nope", args.Service.Proxy.DestinationServiceName), nil)
+		resp := httptest.NewRecorder()
+		a.srv.HealthConnectServiceNodes(resp, req)
+		assert.Equal(400, resp.Code)
+
+		body, err := ioutil.ReadAll(resp.Body)
+		assert.Nil(err)
+		assert.True(bytes.Contains(body, []byte("Invalid value for ?passing")))
+	})
 }
 
 func TestFilterNonPassing(t *testing.T) {

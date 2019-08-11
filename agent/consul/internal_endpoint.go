@@ -3,9 +3,12 @@ package consul
 import (
 	"fmt"
 
+	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/consul/state"
-	"github.com/hashicorp/consul/agent/consul/structs"
+	"github.com/hashicorp/consul/agent/structs"
+	bexpr "github.com/hashicorp/go-bexpr"
 	"github.com/hashicorp/go-memdb"
+	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/serf/serf"
 )
 
@@ -44,6 +47,11 @@ func (m *Internal) NodeDump(args *structs.DCSpecificRequest,
 		return err
 	}
 
+	filter, err := bexpr.CreateFilter(args.Filter, nil, reply.Dump)
+	if err != nil {
+		return err
+	}
+
 	return m.srv.blockingQuery(
 		&args.QueryOptions,
 		&reply.QueryMeta,
@@ -54,7 +62,51 @@ func (m *Internal) NodeDump(args *structs.DCSpecificRequest,
 			}
 
 			reply.Index, reply.Dump = index, dump
-			return m.srv.filterACL(args.Token, reply)
+			if err := m.srv.filterACL(args.Token, reply); err != nil {
+				return err
+			}
+
+			raw, err := filter.Execute(reply.Dump)
+			if err != nil {
+				return err
+			}
+
+			reply.Dump = raw.(structs.NodeDump)
+			return nil
+		})
+}
+
+func (m *Internal) ServiceDump(args *structs.DCSpecificRequest, reply *structs.IndexedCheckServiceNodes) error {
+	if done, err := m.srv.forward("Internal.ServiceDump", args, args, reply); done {
+		return err
+	}
+
+	filter, err := bexpr.CreateFilter(args.Filter, nil, reply.Nodes)
+	if err != nil {
+		return err
+	}
+
+	return m.srv.blockingQuery(
+		&args.QueryOptions,
+		&reply.QueryMeta,
+		func(ws memdb.WatchSet, state *state.Store) error {
+			index, nodes, err := state.ServiceDump(ws)
+			if err != nil {
+				return err
+			}
+
+			reply.Index, reply.Nodes = index, nodes
+			if err := m.srv.filterACL(args.Token, reply); err != nil {
+				return err
+			}
+
+			raw, err := filter.Execute(reply.Nodes)
+			if err != nil {
+				return err
+			}
+
+			reply.Nodes = raw.(structs.CheckServiceNodes)
+			return nil
 		})
 }
 
@@ -68,14 +120,14 @@ func (m *Internal) EventFire(args *structs.EventFireRequest,
 	}
 
 	// Check ACLs
-	acl, err := m.srv.resolveToken(args.Token)
+	rule, err := m.srv.ResolveToken(args.Token)
 	if err != nil {
 		return err
 	}
 
-	if acl != nil && !acl.EventWrite(args.Name) {
+	if rule != nil && !rule.EventWrite(args.Name) {
 		m.srv.logger.Printf("[WARN] consul: user event %q blocked by ACLs", args.Name)
-		return errPermissionDenied
+		return acl.ErrPermissionDenied
 	}
 
 	// Set the query meta data
@@ -84,8 +136,17 @@ func (m *Internal) EventFire(args *structs.EventFireRequest,
 	// Add the consul prefix to the event name
 	eventName := userEventName(args.Name)
 
-	// Fire the event
-	return m.srv.serfLAN.UserEvent(eventName, args.Payload, false)
+	// Fire the event on all LAN segments
+	segments := m.srv.LANSegments()
+	var errs error
+	for name, segment := range segments {
+		err := segment.UserEvent(eventName, args.Payload, false)
+		if err != nil {
+			err = fmt.Errorf("error broadcasting event to segment %q: %v", name, err)
+			errs = multierror.Append(errs, err)
+		}
+	}
+	return errs
 }
 
 // KeyringOperation will query the WAN and LAN gossip keyrings of all nodes.
@@ -94,14 +155,14 @@ func (m *Internal) KeyringOperation(
 	reply *structs.KeyringResponses) error {
 
 	// Check ACLs
-	acl, err := m.srv.resolveToken(args.Token)
+	rule, err := m.srv.ResolveToken(args.Token)
 	if err != nil {
 		return err
 	}
-	if acl != nil {
+	if rule != nil {
 		switch args.Operation {
 		case structs.KeyringList:
-			if !acl.KeyringRead() {
+			if !rule.KeyringRead() {
 				return fmt.Errorf("Reading keyring denied by ACLs")
 			}
 		case structs.KeyringInstall:
@@ -109,7 +170,7 @@ func (m *Internal) KeyringOperation(
 		case structs.KeyringUse:
 			fallthrough
 		case structs.KeyringRemove:
-			if !acl.KeyringWrite() {
+			if !rule.KeyringWrite() {
 				return fmt.Errorf("Modifying keyring denied due to ACLs")
 			}
 		default:
@@ -118,7 +179,7 @@ func (m *Internal) KeyringOperation(
 	}
 
 	// Only perform WAN keyring querying and RPC forwarding once
-	if !args.Forwarded {
+	if !args.Forwarded && m.srv.serfWAN != nil {
 		args.Forwarded = true
 		m.executeKeyringOp(args, reply, true)
 		return m.srv.globalRPC("Internal.KeyringOperation", args, reply)
@@ -129,23 +190,36 @@ func (m *Internal) KeyringOperation(
 	return nil
 }
 
-// executeKeyringOp executes the appropriate keyring-related function based on
-// the type of keyring operation in the request. It takes the KeyManager as an
-// argument, so it can handle any operation for either LAN or WAN pools.
+// executeKeyringOp executes the keyring-related operation in the request
+// on either the WAN or LAN pools.
 func (m *Internal) executeKeyringOp(
 	args *structs.KeyringRequest,
 	reply *structs.KeyringResponses,
 	wan bool) {
 
+	if wan {
+		mgr := m.srv.KeyManagerWAN()
+		m.executeKeyringOpMgr(mgr, args, reply, wan, "")
+	} else {
+		segments := m.srv.LANSegments()
+		for name, segment := range segments {
+			mgr := segment.KeyManager()
+			m.executeKeyringOpMgr(mgr, args, reply, wan, name)
+		}
+	}
+}
+
+// executeKeyringOpMgr executes the appropriate keyring-related function based on
+// the type of keyring operation in the request. It takes the KeyManager as an
+// argument, so it can handle any operation for either LAN or WAN pools.
+func (m *Internal) executeKeyringOpMgr(
+	mgr *serf.KeyManager,
+	args *structs.KeyringRequest,
+	reply *structs.KeyringResponses,
+	wan bool,
+	segment string) {
 	var serfResp *serf.KeyResponse
 	var err error
-	var mgr *serf.KeyManager
-
-	if wan {
-		mgr = m.srv.KeyManagerWAN()
-	} else {
-		mgr = m.srv.KeyManagerLAN()
-	}
 
 	opts := &serf.KeyRequestOptions{RelayFactor: args.RelayFactor}
 	switch args.Operation {
@@ -167,6 +241,7 @@ func (m *Internal) executeKeyringOp(
 	reply.Responses = append(reply.Responses, &structs.KeyringResponse{
 		WAN:        wan,
 		Datacenter: m.srv.config.Datacenter,
+		Segment:    segment,
 		Messages:   serfResp.Messages,
 		Keys:       serfResp.Keys,
 		NumNodes:   serfResp.NumNodes,

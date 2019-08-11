@@ -43,9 +43,11 @@ type InmemTransport struct {
 	timeout    time.Duration
 }
 
-// NewInmemTransport is used to initialize a new transport
-// and generates a random local address if none is specified
-func NewInmemTransport(addr ServerAddress) (ServerAddress, *InmemTransport) {
+// NewInmemTransportWithTimeout is used to initialize a new transport and
+// generates a random local address if none is specified. The given timeout
+// will be used to decide how long to wait for a connected peer to process the
+// RPCs that we're sending it. See also Connect() and Consumer().
+func NewInmemTransportWithTimeout(addr ServerAddress, timeout time.Duration) (ServerAddress, *InmemTransport) {
 	if string(addr) == "" {
 		addr = NewInmemAddr()
 	}
@@ -53,9 +55,15 @@ func NewInmemTransport(addr ServerAddress) (ServerAddress, *InmemTransport) {
 		consumerCh: make(chan RPC, 16),
 		localAddr:  addr,
 		peers:      make(map[ServerAddress]*InmemTransport),
-		timeout:    50 * time.Millisecond,
+		timeout:    timeout,
 	}
 	return addr, trans
+}
+
+// NewInmemTransport is used to initialize a new transport
+// and generates a random local address if none is specified
+func NewInmemTransport(addr ServerAddress) (ServerAddress, *InmemTransport) {
+	return NewInmemTransportWithTimeout(addr, 50*time.Millisecond)
 }
 
 // SetHeartbeatHandler is used to set optional fast-path for
@@ -75,22 +83,21 @@ func (i *InmemTransport) LocalAddr() ServerAddress {
 
 // AppendEntriesPipeline returns an interface that can be used to pipeline
 // AppendEntries requests.
-func (i *InmemTransport) AppendEntriesPipeline(target ServerAddress) (AppendPipeline, error) {
-	i.RLock()
+func (i *InmemTransport) AppendEntriesPipeline(id ServerID, target ServerAddress) (AppendPipeline, error) {
+	i.Lock()
+	defer i.Unlock()
+
 	peer, ok := i.peers[target]
-	i.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("failed to connect to peer: %v", target)
 	}
 	pipeline := newInmemPipeline(i, peer, target)
-	i.Lock()
 	i.pipelines = append(i.pipelines, pipeline)
-	i.Unlock()
 	return pipeline, nil
 }
 
 // AppendEntries implements the Transport interface.
-func (i *InmemTransport) AppendEntries(target ServerAddress, args *AppendEntriesRequest, resp *AppendEntriesResponse) error {
+func (i *InmemTransport) AppendEntries(id ServerID, target ServerAddress, args *AppendEntriesRequest, resp *AppendEntriesResponse) error {
 	rpcResp, err := i.makeRPC(target, args, nil, i.timeout)
 	if err != nil {
 		return err
@@ -103,7 +110,7 @@ func (i *InmemTransport) AppendEntries(target ServerAddress, args *AppendEntries
 }
 
 // RequestVote implements the Transport interface.
-func (i *InmemTransport) RequestVote(target ServerAddress, args *RequestVoteRequest, resp *RequestVoteResponse) error {
+func (i *InmemTransport) RequestVote(id ServerID, target ServerAddress, args *RequestVoteRequest, resp *RequestVoteResponse) error {
 	rpcResp, err := i.makeRPC(target, args, nil, i.timeout)
 	if err != nil {
 		return err
@@ -116,7 +123,7 @@ func (i *InmemTransport) RequestVote(target ServerAddress, args *RequestVoteRequ
 }
 
 // InstallSnapshot implements the Transport interface.
-func (i *InmemTransport) InstallSnapshot(target ServerAddress, args *InstallSnapshotRequest, resp *InstallSnapshotResponse, data io.Reader) error {
+func (i *InmemTransport) InstallSnapshot(id ServerID, target ServerAddress, args *InstallSnapshotRequest, resp *InstallSnapshotResponse, data io.Reader) error {
 	rpcResp, err := i.makeRPC(target, args, data, 10*i.timeout)
 	if err != nil {
 		return err
@@ -124,6 +131,19 @@ func (i *InmemTransport) InstallSnapshot(target ServerAddress, args *InstallSnap
 
 	// Copy the result back
 	out := rpcResp.Response.(*InstallSnapshotResponse)
+	*resp = *out
+	return nil
+}
+
+// TimeoutNow implements the Transport interface.
+func (i *InmemTransport) TimeoutNow(id ServerID, target ServerAddress, args *TimeoutNowRequest, resp *TimeoutNowResponse) error {
+	rpcResp, err := i.makeRPC(target, args, nil, 10*i.timeout)
+	if err != nil {
+		return err
+	}
+
+	// Copy the result back
+	out := rpcResp.Response.(*TimeoutNowResponse)
 	*resp = *out
 	return nil
 }
@@ -140,10 +160,16 @@ func (i *InmemTransport) makeRPC(target ServerAddress, args interface{}, r io.Re
 
 	// Send the RPC over
 	respCh := make(chan RPCResponse)
-	peer.consumerCh <- RPC{
+	req := RPC{
 		Command:  args,
 		Reader:   r,
 		RespChan: respCh,
+	}
+	select {
+	case peer.consumerCh <- req:
+	case <-time.After(timeout):
+		err = fmt.Errorf("send timed out")
+		return
 	}
 
 	// Wait for a response
@@ -159,7 +185,7 @@ func (i *InmemTransport) makeRPC(target ServerAddress, args interface{}, r io.Re
 }
 
 // EncodePeer implements the Transport interface.
-func (i *InmemTransport) EncodePeer(p ServerAddress) []byte {
+func (i *InmemTransport) EncodePeer(id ServerID, p ServerAddress) []byte {
 	return []byte(p)
 }
 

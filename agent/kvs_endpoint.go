@@ -8,15 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/hashicorp/consul/agent/consul/structs"
+	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
-)
-
-const (
-	// maxKVSize is used to limit the maximum payload length
-	// of a KV entry. If it exceeds this amount, the client is
-	// likely abusing the KV store.
-	maxKVSize = 512 * 1024
 )
 
 func (s *HTTPServer) KVSEndpoint(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
@@ -48,8 +41,7 @@ func (s *HTTPServer) KVSEndpoint(resp http.ResponseWriter, req *http.Request) (i
 	case "DELETE":
 		return s.KVSDelete(resp, req, &args)
 	default:
-		resp.WriteHeader(405)
-		return nil, nil
+		return nil, MethodNotAllowedError{req.Method, []string{"GET", "PUT", "DELETE"}}
 	}
 }
 
@@ -73,7 +65,7 @@ func (s *HTTPServer) KVSGet(resp http.ResponseWriter, req *http.Request, args *s
 
 	// Check if we get a not found
 	if len(out.Entries) == 0 {
-		resp.WriteHeader(404)
+		resp.WriteHeader(http.StatusNotFound)
 		return nil, nil
 	}
 
@@ -120,7 +112,7 @@ func (s *HTTPServer) KVSGetKeys(resp http.ResponseWriter, req *http.Request, arg
 	// Check if we get a not found. We do not generate
 	// not found for the root, but just provide the empty list
 	if len(out.Keys) == 0 && listArgs.Prefix != "" {
-		resp.WriteHeader(404)
+		resp.WriteHeader(http.StatusNotFound)
 		return nil, nil
 	}
 
@@ -183,9 +175,9 @@ func (s *HTTPServer) KVSPut(resp http.ResponseWriter, req *http.Request, args *s
 	}
 
 	// Check the content-length
-	if req.ContentLength > maxKVSize {
-		resp.WriteHeader(413)
-		fmt.Fprintf(resp, "Value exceeds %d byte limit", maxKVSize)
+	if req.ContentLength > int64(s.agent.config.KVMaxValueSize) {
+		resp.WriteHeader(http.StatusRequestEntityTooLarge)
+		fmt.Fprintf(resp, "Value exceeds %d byte limit", s.agent.config.KVMaxValueSize)
 		return nil, nil
 	}
 
@@ -257,7 +249,7 @@ func (s *HTTPServer) KVSDelete(resp http.ResponseWriter, req *http.Request, args
 // missingKey checks if the key is missing
 func missingKey(resp http.ResponseWriter, args *structs.KeyRequest) bool {
 	if args.Key == "" {
-		resp.WriteHeader(400)
+		resp.WriteHeader(http.StatusBadRequest)
 		fmt.Fprint(resp, "Missing key name")
 		return true
 	}
@@ -272,7 +264,7 @@ func conflictingFlags(resp http.ResponseWriter, req *http.Request, flags ...stri
 	for _, conflict := range flags {
 		if _, ok := params[conflict]; ok {
 			if found {
-				resp.WriteHeader(400)
+				resp.WriteHeader(http.StatusBadRequest)
 				fmt.Fprint(resp, "Conflicting flags: "+params.Encode())
 				return true
 			}

@@ -26,18 +26,21 @@ For multi-key updates, please consider using [transaction](/api/txn.html).
 This endpoint returns the specified key. If no key exists at the given path, a
 404 is returned instead of a 200 response.
 
+For multi-key reads, please consider using [transaction](/api/txn.html).
+
 | Method | Path                         | Produces                   |
 | ------ | ---------------------------- | -------------------------- |
 | `GET`  | `/kv/:key`                   | `application/json`         |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
-| Blocking Queries | Consistency Modes | ACL Required |
-| ---------------- | ----------------- | ------------ |
-| `YES`            | `all`             | `key:read`   |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required |
+| ---------------- | ----------------- | ------------- | ------------ |
+| `YES`            | `all`             | `none`        | `key:read`   |
 
 ### Parameters
 
@@ -59,15 +62,16 @@ The table below shows this endpoint's support for
   metadata). Specifying this implies `recurse`. This is specified as part of the
   URL as a query parameter.
 
-- `separator` `(string: '/')` - Specifies the character to use as a separator
-  for recursive lookups. This is specified as part of the URL as a query
-  parameter.
+- `separator` `(string: '')` - Specifies the string to use as a separator
+  for recursive key lookups. This option is only used when paired with the `keys` 
+  parameter to limit the prefix of keys returned,  only up to the given separator. 
+  This is specified as part of the URL as a query parameter.
 
 ### Sample Request
 
 ```text
 $ curl \
-    https://consul.rocks/v1/kv/my-key
+    http://127.0.0.1:8500/v1/kv/my-key
 ```
 
 ### Sample Response
@@ -151,13 +155,14 @@ Even though the return type is `application/json`, the value is either `true` or
 `false`, indicating whether the create/update succeeded.
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
-| Blocking Queries | Consistency Modes | ACL Required |
-| ---------------- | ----------------- | ------------ |
-| `NO`             | `none`            | `key:write`  |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required |
+| ---------------- | ----------------- | ------------- | ------------ |
+| `NO`             | `none`            | `none`        | `key:write`  |
 
 ### Parameters
 
@@ -177,16 +182,21 @@ The table below shows this endpoint's support for
   index is non-zero, the key is only set if the index matches the `ModifyIndex`
   of that key.
 
-- `acquire` `(string: "")` - Specifies to use a lock acquisition operation. This
-  is useful as it allows leader election to be built on top of Consul. If the
+- `acquire` `(string: "")` - Supply a session ID to use in a lock acquisition operation.
+  This is useful as it allows leader election to be built on top of Consul. If the
   lock is not held and the session is valid, this increments the `LockIndex` and
   sets the `Session` value of the key in addition to updating the key contents.
   A key does not need to exist to be acquired. If the lock is already held by
   the given session, then the `LockIndex` is not incremented but the key
   contents are updated. This lets the current lock holder update the key
-  contents without having to give up the lock and reacquire it.
+  contents without having to give up the lock and reacquire it. **Note that an update
+  that does not include the acquire parameter will proceed normally even if another
+  session has locked the key.**
 
-- `release` `(string: "")` - Specifies to use a lock release operation. This is
+    For an example of how to use the lock feature, see the [Leader Election Guide]
+    (https://learn.hashicorp.com/consul/developer-configuration/elections).
+
+- `release` `(string: "")` - Supply a session ID to use in a release operation. This is
   useful when paired with `?acquire=` as it allows clients to yield a lock. This
   will leave the `LockIndex` unmodified but will clear the associated `Session`
   of the key. The key must be held by this session to be unlocked.
@@ -195,13 +205,20 @@ The table below shows this endpoint's support for
 
 The payload is arbitrary, and is loaded directly into Consul as supplied.
 
-### Sample Request
+### Sample Requests
 
-```text
+```bash
 $ curl \
     --request PUT \
     --data @contents \
-    https://consul.rocks/v1/kv/my-key
+    http://127.0.0.1:8500/v1/kv/my-key
+
+# or
+
+$ curl \
+    --request PUT \
+    --data-binary @contents \
+    http://127.0.0.1:8500/v1/kv/my-key
 ```
 
 ### Sample Response
@@ -219,13 +236,14 @@ This endpoint deletes a single key or all keys sharing a prefix.
 | `DELETE` | `/kv/:key`                   | `application/json`         |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
-| Blocking Queries | Consistency Modes | ACL Required |
-| ---------------- | ----------------- | ------------ |
-| `NO`             | `none`            | `key:write`  |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required |
+| ---------------- | ----------------- | ------------- | ------------ |
+| `NO`             | `none`            | `none`        | `key:write`  |
 
 ### Parameters
 
@@ -244,7 +262,7 @@ The table below shows this endpoint's support for
 ```text
 $ curl \
     --request DELETE \
-    https://consul.rocks/v1/kv/my-key
+    http://127.0.0.1:8500/v1/kv/my-key
 ```
 
 ### Sample Response

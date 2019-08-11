@@ -9,7 +9,7 @@ description: |-
 
 # Network Areas - Operator HTTP API
 
-The `/operator/area` endpoints expose the network tomography information via
+The `/operator/area` endpoints provide tools to manage network areas via
 Consul's HTTP API.
 
 ~> **Enterprise Only!** This API endpoint and functionality only exists in
@@ -26,7 +26,7 @@ datacenters, so not all servers need to be fully connected. This allows for
 complex topologies among Consul datacenters like hub/spoke and more general
 trees.
 
-Please see the [Network Areas Guide](/docs/guides/areas.html) for more details.
+Please see the [Network Areas Guide](https://learn.hashicorp.com/consul/day-2-operations/advanced-federation) for more details.
 
 ## Create Network Area
 
@@ -38,13 +38,14 @@ successfully.
 | `POST` | `/operator/area`             | `application/json`         |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
-| Blocking Queries | Consistency Modes | ACL Required     |
-| ---------------- | ----------------- | ---------------- |
-| `NO`             | `none`            | `operator:write` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required     |
+| ---------------- | ----------------- | ------------- | ---------------- |
+| `NO`             | `none`            | `none`        | `operator:write` |
 
 ### Parameters
 
@@ -52,7 +53,7 @@ The table below shows this endpoint's support for
   the datacenter of the agent being queried. This is specified as a URL query
   parameter.
 
-- `PeerDatacenter` `(string: <required>)` - Specifes the name of the Consul
+- `PeerDatacenter` `(string: <required>)` - Specifies the name of the Consul
   datacenter that will be joined the Consul servers in the current datacenter to
   form the area. Only one area is allowed for each possible `PeerDatacenter`,
   and a datacenter cannot form an area with itself.
@@ -64,12 +65,16 @@ The table below shows this endpoint's support for
   If this list is not supplied, joining can be done with a call to the
   [join endpoint](#area-join) once the network area is created.
 
+- `UseTLS` `(bool: <optional>)` - Specifies whether gossip over this area should be
+  encrypted with TLS if possible.
+
 ### Sample Payload
 
 ```json
 {
   "PeerDatacenter": "dc2",
-  "RetryJoin": [ "10.1.2.3", "10.1.2.4", "10.1.2.5" ]
+  "RetryJoin": [ "10.1.2.3", "10.1.2.4", "10.1.2.5" ],
+  "UseTLS": false
 }
 ```
 
@@ -79,7 +84,7 @@ The table below shows this endpoint's support for
 $ curl \
     --request POST \
     --data @payload.json \
-    https://consul.rocks/v1/operator/area
+    http://127.0.0.1:8500/v1/operator/area
 ```
 
 ### Sample Response
@@ -99,13 +104,14 @@ This endpoint lists all network areas.
 | `GET`  | `/operator/area`             | `application/json`         |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
-| Blocking Queries | Consistency Modes | ACL Required    |
-| ---------------- | ----------------- | --------------- |
-| `YES`            | `all`             | `operator:read` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required    |
+| ---------------- | ----------------- | ------------- | --------------- |
+| `YES`            | `all`             | `none`        | `operator:read` |
 
 ### Parameters
 
@@ -117,7 +123,7 @@ The table below shows this endpoint's support for
 
 ```text
 $ curl \
-    https://consul.rocks/v1/operator/area
+    http://127.0.0.1:8500/v1/operator/area
 ```
 
 ### Sample Response
@@ -132,6 +138,50 @@ $ curl \
 ]
 ```
 
+## Update Network Area
+
+This endpoint updates a network area to the given configuration.
+
+| Method | Path                         | Produces                   |
+| ------ | ---------------------------- | -------------------------- |
+| `PUT`  | `/operator/area/:uuid`       | `application/json`         |
+
+The table below shows this endpoint's support for
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
+
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required     |
+| ---------------- | ----------------- | ------------- | ---------------- |
+| `NO`             | `none`            | `none`        | `operator:write` |
+
+### Parameters
+
+- `dc` `(string: "")` - Specifies the datacenter to query. This will default to
+  the datacenter of the agent being queried. This is specified as a URL query
+  parameter.
+
+- `UseTLS` `(bool: <optional>)` - Specifies whether gossip over this area should be
+  encrypted with TLS if possible.
+
+### Sample Payload
+
+```json
+{
+  "UseTLS": true
+}
+```
+
+### Sample Request
+
+```text
+$ curl \
+    --request PUT \
+    --data @payload.json \
+    http://127.0.0.1:8500/v1/operator/area/8f246b77-f3e1-ff88-5b48-8ec93abf3e05
+```
+
 ## List Specific Network Area
 
 This endpoint lists a specific network area.
@@ -141,13 +191,14 @@ This endpoint lists a specific network area.
 | `GET`  | `/operator/area/:uuid`       | `application/json`         |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
-| Blocking Queries | Consistency Modes | ACL Required    |
-| ---------------- | ----------------- | --------------- |
-| `YES`            | `all`             | `operator:read` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required    |
+| ---------------- | ----------------- | ------------- | --------------- |
+| `YES`            | `all`             | `none`        | `operator:read` |
 
 ### Parameters
 
@@ -162,7 +213,7 @@ The table below shows this endpoint's support for
 
 ```text
 $ curl \
-    https://consul.rocks/v1/operator/area/8f246b77-f3e1-ff88-5b48-8ec93abf3e05
+    http://127.0.0.1:8500/v1/operator/area/8f246b77-f3e1-ff88-5b48-8ec93abf3e05
 ```
 
 ### Sample Response
@@ -186,13 +237,14 @@ This endpoint deletes a specific network area.
 | `DELETE` | `/operator/area/:uuid`       | `application/json`         |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
-| Blocking Queries | Consistency Modes | ACL Required     |
-| ---------------- | ----------------- | ---------------- |
-| `NO`             | `none`            | `operator:write` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required     |
+| ---------------- | ----------------- | ------------- | ---------------- |
+| `NO`             | `none`            | `none`        | `operator:write` |
 
 ### Parameters
 
@@ -208,7 +260,7 @@ The table below shows this endpoint's support for
 ```text
 $ curl \
     --request DELETE \
-    https://consul.rocks/v1/operator/area/8f246b77-f3e1-ff88-5b48-8ec93abf3e05
+    http://127.0.0.1:8500/v1/operator/area/8f246b77-f3e1-ff88-5b48-8ec93abf3e05
 ```
 
 ## Join Network Area
@@ -221,13 +273,14 @@ area.
 | `PUT`  | `/operator/area/:uuid/join`  | `application/json`         |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
-| Blocking Queries | Consistency Modes | ACL Required     |
-| ---------------- | ----------------- | ---------------- |
-| `NO`             | `none`            | `operator:write` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required     |
+| ---------------- | ----------------- | ------------- | ---------------- |
+| `NO`             | `none`            | `none`        | `operator:write` |
 
 ### Parameters
 
@@ -238,7 +291,7 @@ The table below shows this endpoint's support for
   the datacenter of the agent being queried. This is specified as a URL query
   parameter.
 
-### Sample Palyoad
+### Sample Payload
 
 ```json
 ["10.1.2.3", "10.1.2.4", "10.1.2.5"]
@@ -252,7 +305,7 @@ This can be provided as `IP`, `IP:port`, `hostname`, or `hostname:port`.
 $ curl \
     --request PUT \
     --data @payload.json \
-    https://consul.rocks/v1/operator/area/8f246b77-f3e1-ff88-5b48-8ec93abf3e05/join
+    http://127.0.0.1:8500/v1/operator/area/8f246b77-f3e1-ff88-5b48-8ec93abf3e05/join
 ```
 
 ### Sample Response
@@ -293,13 +346,14 @@ network area.
 | `GET`  | `/operator/area/:uuid/members` | `application/json`         |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
-| Blocking Queries | Consistency Modes | ACL Required    |
-| ---------------- | ----------------- | --------------- |
-| `NO`             | `none`            | `operator:read` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required    |
+| ---------------- | ----------------- | ------------- | --------------- |
+| `NO`             | `none`            | `none`        | `operator:read` |
 
 ### Parameters
 
@@ -314,7 +368,7 @@ The table below shows this endpoint's support for
 
 ```text
 $ curl \
-    https://consul.rocks/v1/operator/area/8f246b77-f3e1-ff88-5b48-8ec93abf3e05/members
+    http://127.0.0.1:8500/v1/operator/area/8f246b77-f3e1-ff88-5b48-8ec93abf3e05/members
 ```
 
 ### Sample Response

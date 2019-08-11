@@ -7,14 +7,18 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/hashicorp/consul/acl"
+	"github.com/hashicorp/consul/testrpc"
 )
 
 func TestSnapshot(t *testing.T) {
 	t.Parallel()
 	var snap io.Reader
-	t.Run("", func(t *testing.T) {
-		a := NewTestAgent(t.Name(), nil)
+	t.Run("create snapshot", func(t *testing.T) {
+		a := NewTestAgent(t, t.Name(), "")
 		defer a.Shutdown()
+		testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
 		body := bytes.NewBuffer(nil)
 		req, _ := http.NewRequest("GET", "/v1/snapshot?token=root", body)
@@ -38,9 +42,10 @@ func TestSnapshot(t *testing.T) {
 		}
 	})
 
-	t.Run("", func(t *testing.T) {
-		a := NewTestAgent(t.Name(), nil)
+	t.Run("restore snapshot", func(t *testing.T) {
+		a := NewTestAgent(t, t.Name(), "")
 		defer a.Shutdown()
+		testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
 		req, _ := http.NewRequest("PUT", "/v1/snapshot?token=root", snap)
 		resp := httptest.NewRecorder()
@@ -54,20 +59,20 @@ func TestSnapshot_Options(t *testing.T) {
 	t.Parallel()
 	for _, method := range []string{"GET", "PUT"} {
 		t.Run(method, func(t *testing.T) {
-			a := NewTestAgent(t.Name(), TestACLConfig())
+			a := NewTestAgent(t, t.Name(), TestACLConfig())
 			defer a.Shutdown()
 
 			body := bytes.NewBuffer(nil)
 			req, _ := http.NewRequest(method, "/v1/snapshot?token=anonymous", body)
 			resp := httptest.NewRecorder()
 			_, err := a.srv.Snapshot(resp, req)
-			if err == nil || !strings.Contains(err.Error(), "Permission denied") {
+			if !acl.IsErrPermissionDenied(err) {
 				t.Fatalf("err: %v", err)
 			}
 		})
 
 		t.Run(method, func(t *testing.T) {
-			a := NewTestAgent(t.Name(), TestACLConfig())
+			a := NewTestAgent(t, t.Name(), TestACLConfig())
 			defer a.Shutdown()
 
 			body := bytes.NewBuffer(nil)
@@ -80,7 +85,7 @@ func TestSnapshot_Options(t *testing.T) {
 		})
 
 		t.Run(method, func(t *testing.T) {
-			a := NewTestAgent(t.Name(), TestACLConfig())
+			a := NewTestAgent(t, t.Name(), TestACLConfig())
 			defer a.Shutdown()
 
 			body := bytes.NewBuffer(nil)
@@ -98,39 +103,4 @@ func TestSnapshot_Options(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestSnapshot_BadMethods(t *testing.T) {
-	t.Parallel()
-	t.Run("", func(t *testing.T) {
-		a := NewTestAgent(t.Name(), nil)
-		defer a.Shutdown()
-
-		body := bytes.NewBuffer(nil)
-		req, _ := http.NewRequest("POST", "/v1/snapshot", body)
-		resp := httptest.NewRecorder()
-		_, err := a.srv.Snapshot(resp, req)
-		if err != nil {
-			t.Fatalf("err: %v", err)
-		}
-		if resp.Code != 405 {
-			t.Fatalf("bad code: %d", resp.Code)
-		}
-	})
-
-	t.Run("", func(t *testing.T) {
-		a := NewTestAgent(t.Name(), nil)
-		defer a.Shutdown()
-
-		body := bytes.NewBuffer(nil)
-		req, _ := http.NewRequest("DELETE", "/v1/snapshot", body)
-		resp := httptest.NewRecorder()
-		_, err := a.srv.Snapshot(resp, req)
-		if err != nil {
-			t.Fatalf("err: %v", err)
-		}
-		if resp.Code != 405 {
-			t.Fatalf("bad code: %d", resp.Code)
-		}
-	})
 }

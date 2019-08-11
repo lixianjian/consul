@@ -4,50 +4,21 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
-	"github.com/hashicorp/consul/agent/consul/structs"
-	"github.com/hashicorp/consul/testutil/retry"
+	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/sdk/testutil/retry"
+	"github.com/hashicorp/consul/testrpc"
 	"github.com/hashicorp/serf/coordinate"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
-
-func TestCatalogRegister(t *testing.T) {
-	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
-	defer a.Shutdown()
-
-	// Register node
-	args := &structs.RegisterRequest{
-		Node:    "foo",
-		Address: "127.0.0.1",
-	}
-	req, _ := http.NewRequest("GET", "/v1/catalog/register", jsonReader(args))
-	obj, err := a.srv.CatalogRegister(nil, req)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	res := obj.(bool)
-	if res != true {
-		t.Fatalf("bad: %v", res)
-	}
-
-	// Service should be in sync
-	if err := a.state.syncService("foo"); err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if _, ok := a.state.serviceStatus["foo"]; !ok {
-		t.Fatalf("bad: %#v", a.state.serviceStatus)
-	}
-	if !a.state.serviceStatus["foo"].inSync {
-		t.Fatalf("should be in sync")
-	}
-}
 
 func TestCatalogRegister_Service_InvalidAddress(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	for _, addr := range []string{"0.0.0.0", "::", "[::]"} {
@@ -61,7 +32,7 @@ func TestCatalogRegister_Service_InvalidAddress(t *testing.T) {
 					Port:    8080,
 				},
 			}
-			req, _ := http.NewRequest("GET", "/v1/catalog/register", jsonReader(args))
+			req, _ := http.NewRequest("PUT", "/v1/catalog/register", jsonReader(args))
 			_, err := a.srv.CatalogRegister(nil, req)
 			if err == nil || err.Error() != "Invalid service address" {
 				t.Fatalf("err: %v", err)
@@ -72,12 +43,12 @@ func TestCatalogRegister_Service_InvalidAddress(t *testing.T) {
 
 func TestCatalogDeregister(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	// Register node
 	args := &structs.DeregisterRequest{Node: "foo"}
-	req, _ := http.NewRequest("GET", "/v1/catalog/deregister", jsonReader(args))
+	req, _ := http.NewRequest("PUT", "/v1/catalog/deregister", jsonReader(args))
 	obj, err := a.srv.CatalogDeregister(nil, req)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -91,11 +62,12 @@ func TestCatalogDeregister(t *testing.T) {
 
 func TestCatalogDatacenters(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	retry.Run(t, func(r *retry.R) {
-		obj, err := a.srv.CatalogDatacenters(nil, nil)
+		req, _ := http.NewRequest("GET", "/v1/catalog/datacenters", nil)
+		obj, err := a.srv.CatalogDatacenters(nil, req)
 		if err != nil {
 			r.Fatal(err)
 		}
@@ -109,8 +81,9 @@ func TestCatalogDatacenters(t *testing.T) {
 
 func TestCatalogNodes(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
 	// Register node
 	args := &structs.RegisterRequest{
@@ -136,14 +109,15 @@ func TestCatalogNodes(t *testing.T) {
 
 	nodes := obj.(structs.Nodes)
 	if len(nodes) != 2 {
-		t.Fatalf("bad: %v", obj)
+		t.Fatalf("bad: %v ; nodes:=%v", obj, nodes)
 	}
 }
 
 func TestCatalogNodes_MetaFilter(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
 	// Register a node with a meta field
 	args := &structs.RegisterRequest{
@@ -180,27 +154,67 @@ func TestCatalogNodes_MetaFilter(t *testing.T) {
 	}
 }
 
+func TestCatalogNodes_Filter(t *testing.T) {
+	t.Parallel()
+	a := NewTestAgent(t, t.Name(), "")
+	defer a.Shutdown()
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
+
+	// Register a node with a meta field
+	args := &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "foo",
+		Address:    "127.0.0.1",
+		NodeMeta: map[string]string{
+			"somekey": "somevalue",
+		},
+	}
+
+	var out struct{}
+	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+
+	req, _ := http.NewRequest("GET", "/v1/catalog/nodes?filter="+url.QueryEscape("Meta.somekey == somevalue"), nil)
+	resp := httptest.NewRecorder()
+	obj, err := a.srv.CatalogNodes(resp, req)
+	require.NoError(t, err)
+
+	// Verify an index is set
+	assertIndex(t, resp)
+
+	// Verify we only get the node with the correct meta field back
+	nodes := obj.(structs.Nodes)
+	require.Len(t, nodes, 1)
+
+	v, ok := nodes[0].Meta["somekey"]
+	require.True(t, ok)
+	require.Equal(t, v, "somevalue")
+}
+
 func TestCatalogNodes_WanTranslation(t *testing.T) {
 	t.Parallel()
-	cfg1 := TestConfig()
-	cfg1.Datacenter = "dc1"
-	cfg1.TranslateWanAddrs = true
-	cfg1.ACLDatacenter = ""
-	a1 := NewTestAgent(t.Name(), cfg1)
+	a1 := NewTestAgent(t, t.Name(), `
+		datacenter = "dc1"
+		translate_wan_addrs = true
+		acl_datacenter = ""
+	`)
 	defer a1.Shutdown()
+	testrpc.WaitForTestAgent(t, a1.RPC, "dc1")
 
-	cfg2 := TestConfig()
-	cfg2.Datacenter = "dc2"
-	cfg2.TranslateWanAddrs = true
-	cfg2.ACLDatacenter = ""
-	a2 := NewTestAgent(t.Name(), cfg2)
+	a2 := NewTestAgent(t, t.Name(), `
+		datacenter = "dc2"
+		translate_wan_addrs = true
+		acl_datacenter = ""
+	`)
 	defer a2.Shutdown()
+	testrpc.WaitForTestAgent(t, a2.RPC, "dc2")
 
 	// Wait for the WAN join.
-	addr := fmt.Sprintf("127.0.0.1:%d", a1.Config.Ports.SerfWan)
+	addr := fmt.Sprintf("127.0.0.1:%d", a1.Config.SerfPortWAN)
 	if _, err := a2.JoinWAN([]string{addr}); err != nil {
 		t.Fatalf("err: %v", err)
 	}
+	testrpc.WaitForLeader(t, a1.RPC, "dc1")
+	testrpc.WaitForLeader(t, a2.RPC, "dc2")
 	retry.Run(t, func(r *retry.R) {
 		if got, want := len(a1.WANMembers()), 2; got < want {
 			r.Fatalf("got %d WAN members want at least %d", got, want)
@@ -239,7 +253,7 @@ func TestCatalogNodes_WanTranslation(t *testing.T) {
 	// Expect that DC1 gives us a WAN address (since the node is in DC2).
 	nodes1 := obj1.(structs.Nodes)
 	if len(nodes1) != 2 {
-		t.Fatalf("bad: %v", obj1)
+		t.Fatalf("bad: %v, nodes:=%v", obj1, nodes1)
 	}
 	var address string
 	for _, node := range nodes1 {
@@ -276,8 +290,9 @@ func TestCatalogNodes_WanTranslation(t *testing.T) {
 
 func TestCatalogNodes_Blocking(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
 	// Register node
 	args := &structs.DCSpecificRequest{
@@ -295,6 +310,7 @@ func TestCatalogNodes_Blocking(t *testing.T) {
 	// an error channel instead.
 	errch := make(chan error, 2)
 	go func() {
+		testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 		start := time.Now()
 
 		// register a service after the blocking call
@@ -318,7 +334,7 @@ func TestCatalogNodes_Blocking(t *testing.T) {
 		}
 
 		// Should block for a while
-		if d := time.Now().Sub(start); d < 50*time.Millisecond {
+		if d := time.Since(start); d < 50*time.Millisecond {
 			errch <- fmt.Errorf("too fast: %v", d)
 		}
 
@@ -344,8 +360,9 @@ func TestCatalogNodes_Blocking(t *testing.T) {
 
 func TestCatalogNodes_DistanceSort(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
 	// Register nodes.
 	args := &structs.RegisterRequest{
@@ -428,8 +445,9 @@ func TestCatalogNodes_DistanceSort(t *testing.T) {
 
 func TestCatalogServices(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
 	// Register node
 	args := &structs.RegisterRequest{
@@ -463,7 +481,7 @@ func TestCatalogServices(t *testing.T) {
 
 func TestCatalogServices_NodeMetaFilter(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	// Register node
@@ -504,8 +522,11 @@ func TestCatalogServices_NodeMetaFilter(t *testing.T) {
 
 func TestCatalogServiceNodes(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
+
+	assert := assert.New(t)
+	require := require.New(t)
 
 	// Make sure an empty list is returned, not a nil
 	{
@@ -553,11 +574,68 @@ func TestCatalogServiceNodes(t *testing.T) {
 	if len(nodes) != 1 {
 		t.Fatalf("bad: %v", obj)
 	}
+
+	// Test caching
+	{
+		// List instances with cache enabled
+		req, _ := http.NewRequest("GET", "/v1/catalog/service/api?cached", nil)
+		resp := httptest.NewRecorder()
+		obj, err := a.srv.CatalogServiceNodes(resp, req)
+		require.NoError(err)
+		nodes := obj.(structs.ServiceNodes)
+		assert.Len(nodes, 1)
+
+		// Should be a cache miss
+		assert.Equal("MISS", resp.Header().Get("X-Cache"))
+	}
+
+	{
+		// List instances with cache enabled
+		req, _ := http.NewRequest("GET", "/v1/catalog/service/api?cached", nil)
+		resp := httptest.NewRecorder()
+		obj, err := a.srv.CatalogServiceNodes(resp, req)
+		require.NoError(err)
+		nodes := obj.(structs.ServiceNodes)
+		assert.Len(nodes, 1)
+
+		// Should be a cache HIT now!
+		assert.Equal("HIT", resp.Header().Get("X-Cache"))
+		assert.Equal("0", resp.Header().Get("Age"))
+	}
+
+	// Ensure background refresh works
+	{
+		// Register a new instance of the service
+		args2 := args
+		args2.Node = "bar"
+		args2.Address = "127.0.0.2"
+		require.NoError(a.RPC("Catalog.Register", args, &out))
+
+		retry.Run(t, func(r *retry.R) {
+			// List it again
+			req, _ := http.NewRequest("GET", "/v1/catalog/service/api?cached", nil)
+			resp := httptest.NewRecorder()
+			obj, err := a.srv.CatalogServiceNodes(resp, req)
+			r.Check(err)
+
+			nodes := obj.(structs.ServiceNodes)
+			if len(nodes) != 2 {
+				r.Fatalf("Want 2 nodes")
+			}
+
+			// Should be a cache hit! The data should've updated in the cache
+			// in the background so this should've been fetched directly from
+			// the cache.
+			if resp.Header().Get("X-Cache") != "HIT" {
+				r.Fatalf("should be a cache hit")
+			}
+		})
+	}
 }
 
 func TestCatalogServiceNodes_NodeMetaFilter(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	// Make sure an empty list is returned, not a nil
@@ -610,24 +688,87 @@ func TestCatalogServiceNodes_NodeMetaFilter(t *testing.T) {
 	}
 }
 
+func TestCatalogServiceNodes_Filter(t *testing.T) {
+	t.Parallel()
+	a := NewTestAgent(t, t.Name(), "")
+	defer a.Shutdown()
+
+	queryPath := "/v1/catalog/service/api?filter=" + url.QueryEscape("ServiceMeta.somekey == somevalue")
+
+	// Make sure an empty list is returned, not a nil
+	{
+		req, _ := http.NewRequest("GET", queryPath, nil)
+		resp := httptest.NewRecorder()
+		obj, err := a.srv.CatalogServiceNodes(resp, req)
+		require.NoError(t, err)
+
+		assertIndex(t, resp)
+
+		nodes := obj.(structs.ServiceNodes)
+		require.Empty(t, nodes)
+	}
+
+	// Register node
+	args := &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "foo",
+		Address:    "127.0.0.1",
+		Service: &structs.NodeService{
+			Service: "api",
+			Meta: map[string]string{
+				"somekey": "somevalue",
+			},
+		},
+	}
+
+	var out struct{}
+	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+
+	// Register a second service for the node
+	args = &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "foo",
+		Address:    "127.0.0.1",
+		Service: &structs.NodeService{
+			ID:      "api2",
+			Service: "api",
+			Meta: map[string]string{
+				"somekey": "notvalue",
+			},
+		},
+		SkipNodeUpdate: true,
+	}
+
+	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+
+	req, _ := http.NewRequest("GET", queryPath, nil)
+	resp := httptest.NewRecorder()
+	obj, err := a.srv.CatalogServiceNodes(resp, req)
+	require.NoError(t, err)
+	assertIndex(t, resp)
+
+	nodes := obj.(structs.ServiceNodes)
+	require.Len(t, nodes, 1)
+}
+
 func TestCatalogServiceNodes_WanTranslation(t *testing.T) {
 	t.Parallel()
-	cfg1 := TestConfig()
-	cfg1.Datacenter = "dc1"
-	cfg1.TranslateWanAddrs = true
-	cfg1.ACLDatacenter = ""
-	a1 := NewTestAgent(t.Name(), cfg1)
+	a1 := NewTestAgent(t, t.Name(), `
+		datacenter = "dc1"
+		translate_wan_addrs = true
+		acl_datacenter = ""
+	`)
 	defer a1.Shutdown()
 
-	cfg2 := TestConfig()
-	cfg2.Datacenter = "dc2"
-	cfg2.TranslateWanAddrs = true
-	cfg2.ACLDatacenter = ""
-	a2 := NewTestAgent(t.Name(), cfg2)
+	a2 := NewTestAgent(t, t.Name(), `
+		datacenter = "dc2"
+		translate_wan_addrs = true
+		acl_datacenter = ""
+	`)
 	defer a2.Shutdown()
 
 	// Wait for the WAN join.
-	addr := fmt.Sprintf("127.0.0.1:%d", a1.Config.Ports.SerfWan)
+	addr := fmt.Sprintf("127.0.0.1:%d", a1.Config.SerfPortWAN)
 	if _, err := a2.srv.agent.JoinWAN([]string{addr}); err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -697,8 +838,9 @@ func TestCatalogServiceNodes_WanTranslation(t *testing.T) {
 
 func TestCatalogServiceNodes_DistanceSort(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
+	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
 	// Register nodes.
 	args := &structs.RegisterRequest{
@@ -782,12 +924,111 @@ func TestCatalogServiceNodes_DistanceSort(t *testing.T) {
 	}
 }
 
+// Test that connect proxies can be queried via /v1/catalog/service/:service
+// directly and that their results contain the proxy fields.
+func TestCatalogServiceNodes_ConnectProxy(t *testing.T) {
+	t.Parallel()
+
+	assert := assert.New(t)
+	a := NewTestAgent(t, t.Name(), "")
+	defer a.Shutdown()
+	testrpc.WaitForLeader(t, a.RPC, "dc1")
+
+	// Register
+	args := structs.TestRegisterRequestProxy(t)
+	var out struct{}
+	assert.Nil(a.RPC("Catalog.Register", args, &out))
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf(
+		"/v1/catalog/service/%s", args.Service.Service), nil)
+	resp := httptest.NewRecorder()
+	obj, err := a.srv.CatalogServiceNodes(resp, req)
+	assert.Nil(err)
+	assertIndex(t, resp)
+
+	nodes := obj.(structs.ServiceNodes)
+	assert.Len(nodes, 1)
+	assert.Equal(structs.ServiceKindConnectProxy, nodes[0].ServiceKind)
+	assert.Equal(args.Service.Proxy, nodes[0].ServiceProxy)
+	// DEPRECATED (ProxyDestination) - remove this when removing ProxyDestination
+	assert.Equal(args.Service.Proxy.DestinationServiceName, nodes[0].ServiceProxyDestination)
+}
+
+// Test that the Connect-compatible endpoints can be queried for a
+// service via /v1/catalog/connect/:service.
+func TestCatalogConnectServiceNodes_good(t *testing.T) {
+	t.Parallel()
+
+	assert := assert.New(t)
+	a := NewTestAgent(t, t.Name(), "")
+	defer a.Shutdown()
+	testrpc.WaitForLeader(t, a.RPC, "dc1")
+
+	// Register
+	args := structs.TestRegisterRequestProxy(t)
+	args.Service.Address = "127.0.0.55"
+	var out struct{}
+	assert.Nil(a.RPC("Catalog.Register", args, &out))
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf(
+		"/v1/catalog/connect/%s", args.Service.Proxy.DestinationServiceName), nil)
+	resp := httptest.NewRecorder()
+	obj, err := a.srv.CatalogConnectServiceNodes(resp, req)
+	assert.Nil(err)
+	assertIndex(t, resp)
+
+	nodes := obj.(structs.ServiceNodes)
+	assert.Len(nodes, 1)
+	assert.Equal(structs.ServiceKindConnectProxy, nodes[0].ServiceKind)
+	assert.Equal(args.Service.Address, nodes[0].ServiceAddress)
+	assert.Equal(args.Service.Proxy, nodes[0].ServiceProxy)
+}
+
+func TestCatalogConnectServiceNodes_Filter(t *testing.T) {
+	t.Parallel()
+
+	a := NewTestAgent(t, t.Name(), "")
+	defer a.Shutdown()
+	testrpc.WaitForLeader(t, a.RPC, "dc1")
+
+	// Register
+	args := structs.TestRegisterRequestProxy(t)
+	args.Service.Address = "127.0.0.55"
+	var out struct{}
+	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+
+	args = structs.TestRegisterRequestProxy(t)
+	args.Service.Address = "127.0.0.55"
+	args.Service.Meta = map[string]string{
+		"version": "2",
+	}
+	args.Service.ID = "web-proxy2"
+	args.SkipNodeUpdate = true
+	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf(
+		"/v1/catalog/connect/%s?filter=%s",
+		args.Service.Proxy.DestinationServiceName,
+		url.QueryEscape("ServiceMeta.version == 2")), nil)
+	resp := httptest.NewRecorder()
+	obj, err := a.srv.CatalogConnectServiceNodes(resp, req)
+	require.NoError(t, err)
+	assertIndex(t, resp)
+
+	nodes := obj.(structs.ServiceNodes)
+	require.Len(t, nodes, 1)
+	require.Equal(t, structs.ServiceKindConnectProxy, nodes[0].ServiceKind)
+	require.Equal(t, args.Service.Address, nodes[0].ServiceAddress)
+	require.Equal(t, args.Service.Proxy, nodes[0].ServiceProxy)
+}
+
 func TestCatalogNodeServices(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), nil)
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
-	// Register node
+	// Register node with a regular service and connect proxy
 	args := &structs.RegisterRequest{
 		Datacenter: "dc1",
 		Node:       "foo",
@@ -803,6 +1044,10 @@ func TestCatalogNodeServices(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
+	// Register a connect proxy
+	args.Service = structs.TestNodeServiceProxy(t)
+	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+
 	req, _ := http.NewRequest("GET", "/v1/catalog/node/foo?dc=dc1", nil)
 	resp := httptest.NewRecorder()
 	obj, err := a.srv.CatalogNodeServices(resp, req)
@@ -812,29 +1057,99 @@ func TestCatalogNodeServices(t *testing.T) {
 	assertIndex(t, resp)
 
 	services := obj.(*structs.NodeServices)
-	if len(services.Services) != 1 {
+	if len(services.Services) != 2 {
 		t.Fatalf("bad: %v", obj)
 	}
+
+	// Proxy service should have it's config intact
+	require.Equal(t, args.Service.Proxy, services.Services["web-proxy"].Proxy)
+}
+
+func TestCatalogNodeServices_Filter(t *testing.T) {
+	t.Parallel()
+	a := NewTestAgent(t, t.Name(), "")
+	defer a.Shutdown()
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
+
+	// Register node with a regular service and connect proxy
+	args := &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "foo",
+		Address:    "127.0.0.1",
+		Service: &structs.NodeService{
+			Service: "api",
+			Tags:    []string{"a"},
+		},
+	}
+
+	var out struct{}
+	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+
+	// Register a connect proxy
+	args.Service = structs.TestNodeServiceProxy(t)
+	require.NoError(t, a.RPC("Catalog.Register", args, &out))
+
+	req, _ := http.NewRequest("GET", "/v1/catalog/node/foo?dc=dc1&filter="+url.QueryEscape("Kind == `connect-proxy`"), nil)
+	resp := httptest.NewRecorder()
+	obj, err := a.srv.CatalogNodeServices(resp, req)
+	require.NoError(t, err)
+	assertIndex(t, resp)
+
+	services := obj.(*structs.NodeServices)
+	require.Len(t, services.Services, 1)
+
+	// Proxy service should have it's config intact
+	require.Equal(t, args.Service.Proxy, services.Services["web-proxy"].Proxy)
+}
+
+// Test that the services on a node contain all the Connect proxies on
+// the node as well with their fields properly populated.
+func TestCatalogNodeServices_ConnectProxy(t *testing.T) {
+	t.Parallel()
+
+	assert := assert.New(t)
+	a := NewTestAgent(t, t.Name(), "")
+	defer a.Shutdown()
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
+
+	// Register
+	args := structs.TestRegisterRequestProxy(t)
+	var out struct{}
+	assert.Nil(a.RPC("Catalog.Register", args, &out))
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf(
+		"/v1/catalog/node/%s", args.Node), nil)
+	resp := httptest.NewRecorder()
+	obj, err := a.srv.CatalogNodeServices(resp, req)
+	assert.Nil(err)
+	assertIndex(t, resp)
+
+	ns := obj.(*structs.NodeServices)
+	assert.Len(ns.Services, 1)
+	v := ns.Services[args.Service.Service]
+	assert.Equal(structs.ServiceKindConnectProxy, v.Kind)
 }
 
 func TestCatalogNodeServices_WanTranslation(t *testing.T) {
 	t.Parallel()
-	cfg1 := TestConfig()
-	cfg1.Datacenter = "dc1"
-	cfg1.TranslateWanAddrs = true
-	cfg1.ACLDatacenter = ""
-	a1 := NewTestAgent(t.Name(), cfg1)
+	a1 := NewTestAgent(t, t.Name(), `
+		datacenter = "dc1"
+		translate_wan_addrs = true
+		acl_datacenter = ""
+	`)
 	defer a1.Shutdown()
+	testrpc.WaitForTestAgent(t, a1.RPC, "dc1")
 
-	cfg2 := TestConfig()
-	cfg2.Datacenter = "dc2"
-	cfg2.TranslateWanAddrs = true
-	cfg2.ACLDatacenter = ""
-	a2 := NewTestAgent(t.Name(), cfg2)
+	a2 := NewTestAgent(t, t.Name(), `
+		datacenter = "dc2"
+		translate_wan_addrs = true
+		acl_datacenter = ""
+	`)
 	defer a2.Shutdown()
+	testrpc.WaitForTestAgent(t, a2.RPC, "dc2")
 
 	// Wait for the WAN join.
-	addr := fmt.Sprintf("127.0.0.1:%d", a1.Config.Ports.SerfWan)
+	addr := fmt.Sprintf("127.0.0.1:%d", a1.Config.SerfPortWAN)
 	if _, err := a2.srv.agent.JoinWAN([]string{addr}); err != nil {
 		t.Fatalf("err: %v", err)
 	}

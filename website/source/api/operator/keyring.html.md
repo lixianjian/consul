@@ -26,13 +26,14 @@ read privileges.
 | `GET`  | `/operator/keyring`          | `application/json`         |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
-| Blocking Queries | Consistency Modes | ACL Required   |
-| ---------------- | ----------------- | -------------- |
-| `NO`             | `none`            | `keyring:read` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required   |
+| ---------------- | ----------------- | ------------- | -------------- |
+| `NO`             | `none`            | `none`        | `keyring:read` |
 
 ### Parameters
 
@@ -45,7 +46,7 @@ The table below shows this endpoint's support for
 
 ```text
 $ curl \
-    https://consul.rocks/v1/operator/keyring
+    http://127.0.0.1:8500/v1/operator/keyring
 ```
 
 ### Sample Response
@@ -55,6 +56,7 @@ $ curl \
   {
     "WAN": true,
     "Datacenter": "dc1",
+    "Segment": "",
     "Keys": {
       "0eK8RjnsGC/+I1fJErQsBA==": 1,
       "G/3/L4yOw3e5T7NTvuRi9g==": 1,
@@ -65,6 +67,7 @@ $ curl \
   {
     "WAN": false,
     "Datacenter": "dc1",
+    "Segment": "",
     "Keys": {
       "0eK8RjnsGC/+I1fJErQsBA==": 1,
       "G/3/L4yOw3e5T7NTvuRi9g==": 1,
@@ -80,6 +83,8 @@ $ curl \
 
 - `Datacenter` is the datacenter the block refers to.
 
+- `Segment` is the network segment the block refers to.
+
 - `Keys` is a map of each gossip key to the number of nodes it's currently
   installed on.
 
@@ -94,13 +99,14 @@ This endpoint installs a new gossip encryption key into the cluster.
 | `POST` | `/operator/keyring`          | `application/json`         |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
-| Blocking Queries | Consistency Modes | ACL Required    |
-| ---------------- | ----------------- | --------------- |
-| `NO`             | `none`            | `keyring:write` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required    |
+| ---------------- | ----------------- | ------------- | --------------- |
+| `NO`             | `none`            | `none`        | `keyring:write` |
 
 ### Parameters
 
@@ -126,7 +132,7 @@ The table below shows this endpoint's support for
 $ curl \
     --request POST \
     --data @payload.json \
-    https://consul.rocks/v1/operator/keyring
+    http://127.0.0.1:8500/v1/operator/keyring
 ```
 
 ## Change Primary Gossip Encryption Key
@@ -139,13 +145,14 @@ installed before this operation can succeed.
 | `PUT`  | `/operator/keyring`          | `application/json`         |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
-| Blocking Queries | Consistency Modes | ACL Required    |
-| ---------------- | ----------------- | --------------- |
-| `NO`             | `none`            | `keyring:write` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required    |
+| ---------------- | ----------------- | ------------- | --------------- |
+| `NO`             | `none`            | `none`        | `keyring:write` |
 
 ### Parameters
 
@@ -171,7 +178,7 @@ The table below shows this endpoint's support for
 $ curl \
     --request PUT \
     --data @payload.json \
-    https://consul.rocks/v1/operator/keyring
+    http://127.0.0.1:8500/v1/operator/keyring
 ```
 
 ## Delete Gossip Encryption Key
@@ -179,18 +186,19 @@ $ curl \
 This endpoint removes a gossip encryption key from the cluster. This operation
 may only be performed on keys which are not currently the primary key.
 
-| Method | Path                         | Produces                   |
-| ------ | ---------------------------- | -------------------------- |
-| `GET`  | `/operator/keyring`          | `application/json`         |
+| Method  | Path                         | Produces                   |
+| ------- | ---------------------------- | -------------------------- |
+| `DELETE`| `/operator/keyring`          | `application/json`         |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
-| Blocking Queries | Consistency Modes | ACL Required    |
-| ---------------- | ----------------- | --------------- |
-| `NO`             | `none`            | `keyring:write` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required    |
+| ---------------- | ----------------- | ------------- | --------------- |
+| `NO`             | `none`            | `none`        | `keyring:write` |
 
 ### Parameters
 
@@ -215,5 +223,5 @@ The table below shows this endpoint's support for
 $ curl \
     --request DELETE \
     --data @payload.json \
-    https://consul.rocks/v1/operator/keyring
+    http://127.0.0.1:8500/v1/operator/keyring
 ```

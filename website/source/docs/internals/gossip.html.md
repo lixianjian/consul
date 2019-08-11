@@ -12,13 +12,8 @@ Consul uses a [gossip protocol](https://en.wikipedia.org/wiki/Gossip_protocol)
 to manage membership and broadcast messages to the cluster. All of this is provided
 through the use of the [Serf library](https://www.serf.io/). The gossip protocol
 used by Serf is based on
-["SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol"](http://www.cs.cornell.edu/~asdas/research/dsn02-swim.pdf),
+["SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol"](http://www.cs.cornell.edu/info/projects/spinglass/public_pdfs/swim.pdf),
 with a few minor adaptations. There are more details about [Serf's protocol here](https://www.serf.io/docs/internals/gossip.html).
-
-~> **Advanced Topic!** This page covers technical details of
-the internals of Consul. You don't need to know these details to effectively
-operate and use Consul. These details are documented here for those who wish
-to learn about them without having to go spelunking through the source code.
 
 ## Gossip in Consul
 
@@ -29,7 +24,7 @@ used for a few purposes. Membership information allows clients to automatically 
 servers, reducing the amount of configuration needed. The distributed failure detection
 allows the work of failure detection to be shared by the entire cluster instead of
 concentrated on a few servers. Lastly, the gossip pool allows for reliable and fast
-event broadcasts for events like leader election.
+event broadcasts.
 
 The WAN pool is globally unique, as all servers should participate in the WAN pool
 regardless of datacenter. Membership information provided by the WAN pool allows
@@ -54,5 +49,10 @@ telemetry, and simply causing the overall cluster to waste CPU and network
 resources diagnosing a failure that may not truly exist.
 
 Lifeguard completely resolves this issue with novel enhancements to SWIM.
-Please see the [Serf's gossip protocol guide](https://www.serf.io/docs/internals/gossip.html#lifeguard)
-section on Lifeguard for more details.
+
+For more details about Lifeguard, please see the
+[Making Gossip More Robust with Lifeguard](https://www.hashicorp.com/blog/making-gossip-more-robust-with-lifeguard/)
+blog post, which provides a high level overview of the HashiCorp Research paper
+[Lifeguard : SWIM-ing with Situational Awareness](https://arxiv.org/abs/1707.00788). The
+[Serf gossip protocol guide](https://www.serf.io/docs/internals/gossip.html#lifeguard)
+also provides some lower-level details about the gossip protocol and Lifeguard.

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/consul/agent/consul/structs"
+	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/testrpc"
 	"github.com/hashicorp/net-rpc-msgpackrpc"
@@ -131,13 +131,14 @@ func seedCoordinates(t *testing.T, codec rpc.ClientCodec, server *Server) {
 }
 
 func TestRTT_sortNodesByDistanceFrom(t *testing.T) {
+	t.Parallel()
 	dir, server := testServer(t)
 	defer os.RemoveAll(dir)
 	defer server.Shutdown()
 
 	codec := rpcClient(t, server)
 	defer codec.Close()
-	testrpc.WaitForLeader(t, server.RPC, "dc1")
+	testrpc.WaitForTestAgent(t, server.RPC, "dc1")
 
 	seedCoordinates(t, codec, server)
 	nodes := structs.Nodes{
@@ -183,13 +184,14 @@ func TestRTT_sortNodesByDistanceFrom(t *testing.T) {
 }
 
 func TestRTT_sortNodesByDistanceFrom_Nodes(t *testing.T) {
+	t.Parallel()
 	dir, server := testServer(t)
 	defer os.RemoveAll(dir)
 	defer server.Shutdown()
 
 	codec := rpcClient(t, server)
 	defer codec.Close()
-	testrpc.WaitForLeader(t, server.RPC, "dc1")
+	testrpc.WaitForTestAgent(t, server.RPC, "dc1")
 
 	seedCoordinates(t, codec, server)
 	nodes := structs.Nodes{
@@ -232,13 +234,14 @@ func TestRTT_sortNodesByDistanceFrom_Nodes(t *testing.T) {
 }
 
 func TestRTT_sortNodesByDistanceFrom_ServiceNodes(t *testing.T) {
+	t.Parallel()
 	dir, server := testServer(t)
 	defer os.RemoveAll(dir)
 	defer server.Shutdown()
+	testrpc.WaitForTestAgent(t, server.RPC, "dc1")
 
 	codec := rpcClient(t, server)
 	defer codec.Close()
-	testrpc.WaitForLeader(t, server.RPC, "dc1")
 
 	seedCoordinates(t, codec, server)
 	nodes := structs.ServiceNodes{
@@ -281,6 +284,7 @@ func TestRTT_sortNodesByDistanceFrom_ServiceNodes(t *testing.T) {
 }
 
 func TestRTT_sortNodesByDistanceFrom_HealthChecks(t *testing.T) {
+	t.Parallel()
 	dir, server := testServer(t)
 	defer os.RemoveAll(dir)
 	defer server.Shutdown()
@@ -330,13 +334,14 @@ func TestRTT_sortNodesByDistanceFrom_HealthChecks(t *testing.T) {
 }
 
 func TestRTT_sortNodesByDistanceFrom_CheckServiceNodes(t *testing.T) {
+	t.Parallel()
 	dir, server := testServer(t)
 	defer os.RemoveAll(dir)
 	defer server.Shutdown()
 
 	codec := rpcClient(t, server)
 	defer codec.Close()
-	testrpc.WaitForLeader(t, server.RPC, "dc1")
+	testrpc.WaitForTestAgent(t, server.RPC, "dc1")
 
 	seedCoordinates(t, codec, server)
 	nodes := structs.CheckServiceNodes{

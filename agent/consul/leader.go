@@ -1,30 +1,49 @@
 package consul
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/armon/go-metrics"
-	"github.com/hashicorp/consul/agent/consul/agent"
-	"github.com/hashicorp/consul/agent/consul/structs"
+	metrics "github.com/armon/go-metrics"
+	"github.com/hashicorp/consul/acl"
+	"github.com/hashicorp/consul/agent/connect"
+	ca "github.com/hashicorp/consul/agent/connect/ca"
+	"github.com/hashicorp/consul/agent/consul/autopilot"
+	"github.com/hashicorp/consul/agent/metadata"
+	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
+	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/types"
+	memdb "github.com/hashicorp/go-memdb"
+	uuid "github.com/hashicorp/go-uuid"
+	version "github.com/hashicorp/go-version"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/serf/serf"
+	"golang.org/x/time/rate"
 )
 
 const (
-	SerfCheckID           types.CheckID = "serfHealth"
-	SerfCheckName                       = "Serf Health Status"
-	SerfCheckAliveOutput                = "Agent alive and reachable"
-	SerfCheckFailedOutput               = "Agent not live or unreachable"
-	ConsulServiceID                     = "consul"
-	ConsulServiceName                   = "consul"
-	newLeaderEvent                      = "consul:new-leader"
+	newLeaderEvent      = "consul:new-leader"
+	barrierWriteTimeout = 2 * time.Minute
+)
+
+var (
+	// caRootPruneInterval is how often we check for stale CARoots to remove.
+	caRootPruneInterval = time.Hour
+
+	// minAutopilotVersion is the minimum Consul version in which Autopilot features
+	// are supported.
+	minAutopilotVersion = version.Must(version.NewVersion("0.8.0"))
+
+	// minCentralizedConfigVersion is the minimum Consul version in which centralized
+	// config is supported
+	minCentralizedConfigVersion = version.Must(version.NewVersion("1.5.0"))
 )
 
 // monitorLeadership is used to monitor if we acquire or lose our role
@@ -35,26 +54,71 @@ func (s *Server) monitorLeadership() {
 	// leaderCh, which is only notified best-effort. Doing this ensures
 	// that we get all notifications in order, which is required for
 	// cleanup and to ensure we never run multiple leader loops.
-	leaderCh := s.leaderCh
+	raftNotifyCh := s.raftNotifyCh
 
-	var wg sync.WaitGroup
-	var stopCh chan struct{}
+	aclModeCheckWait := aclModeCheckMinInterval
+	var aclUpgradeCh <-chan time.Time
+	if s.ACLsEnabled() {
+		aclUpgradeCh = time.After(aclModeCheckWait)
+	}
+	var weAreLeaderCh chan struct{}
+	var leaderLoop sync.WaitGroup
 	for {
 		select {
-		case isLeader := <-leaderCh:
-			if isLeader {
-				stopCh = make(chan struct{})
-				wg.Add(1)
-				go func() {
-					s.leaderLoop(stopCh)
-					wg.Done()
-				}()
+		case isLeader := <-raftNotifyCh:
+			switch {
+			case isLeader:
+				if weAreLeaderCh != nil {
+					s.logger.Printf("[ERR] consul: attempted to start the leader loop while running")
+					continue
+				}
+
+				weAreLeaderCh = make(chan struct{})
+				leaderLoop.Add(1)
+				go func(ch chan struct{}) {
+					defer leaderLoop.Done()
+					s.leaderLoop(ch)
+				}(weAreLeaderCh)
 				s.logger.Printf("[INFO] consul: cluster leadership acquired")
-			} else if stopCh != nil {
-				close(stopCh)
-				stopCh = nil
-				wg.Wait()
+
+			default:
+				if weAreLeaderCh == nil {
+					s.logger.Printf("[ERR] consul: attempted to stop the leader loop while not running")
+					continue
+				}
+
+				s.logger.Printf("[DEBUG] consul: shutting down leader loop")
+				close(weAreLeaderCh)
+				leaderLoop.Wait()
+				weAreLeaderCh = nil
 				s.logger.Printf("[INFO] consul: cluster leadership lost")
+			}
+		case <-aclUpgradeCh:
+			if atomic.LoadInt32(&s.useNewACLs) == 0 {
+				aclModeCheckWait = aclModeCheckWait * 2
+				if aclModeCheckWait > aclModeCheckMaxInterval {
+					aclModeCheckWait = aclModeCheckMaxInterval
+				}
+				aclUpgradeCh = time.After(aclModeCheckWait)
+
+				if canUpgrade := s.canUpgradeToNewACLs(weAreLeaderCh != nil); canUpgrade {
+					if weAreLeaderCh != nil {
+						if err := s.initializeACLs(true); err != nil {
+							s.logger.Printf("[ERR] consul: error transitioning to using new ACLs: %v", err)
+							continue
+						}
+					}
+
+					s.logger.Printf("[DEBUG] acl: transitioning out of legacy ACL mode")
+					atomic.StoreInt32(&s.useNewACLs, 1)
+					s.updateACLAdvertisement()
+
+					// setting this to nil ensures that we will never hit this case again
+					aclUpgradeCh = nil
+				}
+			} else {
+				// establishLeadership probably transitioned us
+				aclUpgradeCh = nil
 			}
 		case <-s.shutdownCh:
 			return
@@ -62,32 +126,36 @@ func (s *Server) monitorLeadership() {
 	}
 }
 
+func (s *Server) leadershipTransfer() error {
+	retryCount := 3
+	for i := 0; i < retryCount; i++ {
+		future := s.raft.LeadershipTransfer()
+		if err := future.Error(); err != nil {
+			s.logger.Printf("[ERR] consul: failed to transfer leadership attempt %d/%d: %v", i, retryCount, err)
+		} else {
+			s.logger.Printf("[ERR] consul: successfully transferred leadership attempt %d/%d", i, retryCount)
+			return nil
+		}
+
+	}
+	return fmt.Errorf("failed to transfer leadership in %d attempts", retryCount)
+}
+
 // leaderLoop runs as long as we are the leader to run various
 // maintenance activities
 func (s *Server) leaderLoop(stopCh chan struct{}) {
 	// Fire a user event indicating a new leader
 	payload := []byte(s.config.NodeName)
-	if err := s.serfLAN.UserEvent(newLeaderEvent, payload, false); err != nil {
-		s.logger.Printf("[WARN] consul: failed to broadcast new leader event: %v", err)
+	for name, segment := range s.LANSegments() {
+		if err := segment.UserEvent(newLeaderEvent, payload, false); err != nil {
+			s.logger.Printf("[WARN] consul: failed to broadcast new leader event on segment %q: %v", name, err)
+		}
 	}
 
 	// Reconcile channel is only used once initial reconcile
 	// has succeeded
 	var reconcileCh chan serf.Member
 	establishedLeader := false
-
-	reassert := func() error {
-		if !establishedLeader {
-			return fmt.Errorf("leadership has not been established")
-		}
-		if err := s.revokeLeadership(); err != nil {
-			return err
-		}
-		if err := s.establishLeadership(); err != nil {
-			return err
-		}
-		return nil
-	}
 
 RECONCILE:
 	// Setup a reconciliation timer
@@ -96,18 +164,32 @@ RECONCILE:
 
 	// Apply a raft barrier to ensure our FSM is caught up
 	start := time.Now()
-	barrier := s.raft.Barrier(0)
+	barrier := s.raft.Barrier(barrierWriteTimeout)
 	if err := barrier.Error(); err != nil {
 		s.logger.Printf("[ERR] consul: failed to wait for barrier: %v", err)
 		goto WAIT
 	}
-	metrics.MeasureSince([]string{"consul", "leader", "barrier"}, start)
+	metrics.MeasureSince([]string{"leader", "barrier"}, start)
 
 	// Check if we need to handle initial leadership actions
 	if !establishedLeader {
 		if err := s.establishLeadership(); err != nil {
 			s.logger.Printf("[ERR] consul: failed to establish leadership: %v", err)
-			goto WAIT
+			// Immediately revoke leadership since we didn't successfully
+			// establish leadership.
+			s.revokeLeadership()
+
+			// attempt to transfer leadership. If successful it is
+			// time to leave the leaderLoop since this node is no
+			// longer the leader. If leadershipTransfer() fails, we
+			// will try to acquire it again after
+			// 5 seconds.
+			if err := s.leadershipTransfer(); err != nil {
+				s.logger.Printf("[ERR] consul: %v", err)
+				interval = time.After(5 * time.Second)
+				goto WAIT
+			}
+			return
 		}
 		establishedLeader = true
 		defer s.revokeLeadership()
@@ -124,6 +206,15 @@ RECONCILE:
 	reconcileCh = s.reconcileCh
 
 WAIT:
+	// Poll the stop channel to give it priority so we don't waste time
+	// trying to perform the other operations if we have been asked to shut
+	// down.
+	select {
+	case <-stopCh:
+		return
+	default:
+	}
+
 	// Periodically reconcile as long as we are the leader,
 	// or when Serf events arrive
 	for {
@@ -139,7 +230,47 @@ WAIT:
 		case index := <-s.tombstoneGC.ExpireCh():
 			go s.reapTombstones(index)
 		case errCh := <-s.reassertLeaderCh:
-			errCh <- reassert()
+			// we can get into this state when the initial
+			// establishLeadership has failed as well as the follow
+			// up leadershipTransfer. Afterwards we will be waiting
+			// for the interval to trigger a reconciliation and can
+			// potentially end up here. There is no point to
+			// reassert because this agent was never leader in the
+			// first place.
+			if !establishedLeader {
+				errCh <- fmt.Errorf("leadership has not been established")
+				continue
+			}
+
+			// continue to reassert only if we previously were the
+			// leader, which means revokeLeadership followed by an
+			// establishLeadership().
+			s.revokeLeadership()
+			err := s.establishLeadership()
+			errCh <- err
+
+			// in case establishLeadership failed, we will try to
+			// transfer leadership. At this time raft thinks we are
+			// the leader, but consul disagrees.
+			if err != nil {
+				if err := s.leadershipTransfer(); err != nil {
+					// establishedLeader was true before,
+					// but it no longer is since it revoked
+					// leadership and Leadership transfer
+					// also failed. Which is why it stays
+					// in the leaderLoop, but now
+					// establishedLeader needs to be set to
+					// false.
+					establishedLeader = false
+					interval = time.After(5 * time.Second)
+					goto WAIT
+				}
+
+				// leadershipTransfer was successful and it is
+				// time to leave the leaderLoop.
+				return
+			}
+
 		}
 	}
 }
@@ -149,19 +280,24 @@ WAIT:
 // previously inflight transactions have been committed and that our
 // state is up-to-date.
 func (s *Server) establishLeadership() error {
+	// check for the upgrade here - this helps us transition to new ACLs much
+	// quicker if this is a new cluster or this is a test agent
+	if canUpgrade := s.canUpgradeToNewACLs(true); canUpgrade {
+		if err := s.initializeACLs(true); err != nil {
+			return err
+		}
+		atomic.StoreInt32(&s.useNewACLs, 1)
+		s.updateACLAdvertisement()
+	} else if err := s.initializeACLs(false); err != nil {
+		return err
+	}
+
 	// Hint the tombstone expiration timer. When we freshly establish leadership
 	// we become the authoritative timer, and so we need to start the clock
 	// on any pending GC events.
 	s.tombstoneGC.SetEnabled(true)
 	lastIndex := s.raft.LastIndex()
 	s.tombstoneGC.Hint(lastIndex)
-	s.logger.Printf("[DEBUG] consul: reset tombstone GC to index %d", lastIndex)
-
-	// Setup ACLs if we are the leader and need to
-	if err := s.initializeACL(); err != nil {
-		s.logger.Printf("[ERR] consul: ACL initialization failed: %v", err)
-		return err
-	}
 
 	// Setup the session timers. This is done both when starting up or when
 	// a leader fail over happens. Since the timers are maintained by the leader
@@ -173,158 +309,934 @@ func (s *Server) establishLeadership() error {
 	// are available to be initialized. Otherwise initialization may use stale
 	// data.
 	if err := s.initializeSessionTimers(); err != nil {
-		s.logger.Printf("[ERR] consul: Session Timers initialization failed: %v",
-			err)
 		return err
 	}
 
-	// Setup autopilot config if we need to
-	s.getOrCreateAutopilotConfig()
+	// attempt to bootstrap config entries
+	if err := s.bootstrapConfigEntries(s.config.ConfigEntryBootstrap); err != nil {
+		return err
+	}
 
-	s.startAutopilot()
+	s.getOrCreateAutopilotConfig()
+	s.autopilot.Start()
+
+	// todo(kyhavlov): start a goroutine here for handling periodic CA rotation
+	if err := s.initializeCA(); err != nil {
+		return err
+	}
+
+	s.startConfigReplication()
+
+	s.startEnterpriseLeader()
+
+	s.startCARootPruning()
 
 	s.setConsistentReadReady()
-
 	return nil
 }
 
 // revokeLeadership is invoked once we step down as leader.
 // This is used to cleanup any state that may be specific to a leader.
-func (s *Server) revokeLeadership() error {
+func (s *Server) revokeLeadership() {
 	// Disable the tombstone GC, since it is only useful as a leader
 	s.tombstoneGC.SetEnabled(false)
 
 	// Clear the session timers on either shutdown or step down, since we
 	// are no longer responsible for session expirations.
-	if err := s.clearAllSessionTimers(); err != nil {
-		s.logger.Printf("[ERR] consul: Clearing session timers failed: %v", err)
-		return err
-	}
+	s.clearAllSessionTimers()
+
+	s.stopConfigReplication()
+
+	s.stopEnterpriseLeader()
+
+	s.stopCARootPruning()
+
+	s.setCAProvider(nil, nil)
+
+	s.stopACLTokenReaping()
+
+	s.stopACLUpgrade()
 
 	s.resetConsistentReadReady()
 
-	s.stopAutopilot()
-
-	return nil
+	s.autopilot.Stop()
 }
 
-// initializeACL is used to setup the ACLs if we are the leader
-// and need to do this.
-func (s *Server) initializeACL() error {
-	// Bail if not configured or we are not authoritative
-	authDC := s.config.ACLDatacenter
-	if len(authDC) == 0 || authDC != s.config.Datacenter {
+// DEPRECATED (ACL-Legacy-Compat) - Remove once old ACL compatibility is removed
+func (s *Server) initializeLegacyACL() error {
+	if !s.ACLsEnabled() {
 		return nil
 	}
 
-	// Purge the cache, since it could've changed while we
-	// were not the leader
-	s.aclAuthCache.Purge()
+	authDC := s.config.ACLDatacenter
 
-	// Look for the anonymous token
+	// Create anonymous token if missing.
 	state := s.fsm.State()
-	_, acl, err := state.ACLGet(nil, anonymousToken)
+	_, token, err := state.ACLTokenGetBySecret(nil, anonymousToken)
 	if err != nil {
 		return fmt.Errorf("failed to get anonymous token: %v", err)
 	}
-
-	// Create anonymous token if missing
-	if acl == nil {
+	// Ignoring expiration times to avoid an insertion collision.
+	if token == nil {
 		req := structs.ACLRequest{
 			Datacenter: authDC,
 			Op:         structs.ACLSet,
 			ACL: structs.ACL{
 				ID:   anonymousToken,
 				Name: "Anonymous Token",
-				Type: structs.ACLTypeClient,
+				Type: structs.ACLTokenTypeClient,
 			},
 		}
 		_, err := s.raftApply(structs.ACLRequestType, &req)
 		if err != nil {
 			return fmt.Errorf("failed to create anonymous token: %v", err)
 		}
+		s.logger.Printf("[INFO] acl: Created the anonymous token")
 	}
 
-	// Check for configured master token
-	master := s.config.ACLMasterToken
-	if len(master) == 0 {
-		return nil
-	}
-
-	// Look for the master token
-	_, acl, err = state.ACLGet(nil, master)
-	if err != nil {
-		return fmt.Errorf("failed to get master token: %v", err)
-	}
-	if acl == nil {
-		req := structs.ACLRequest{
-			Datacenter: authDC,
-			Op:         structs.ACLSet,
-			ACL: structs.ACL{
-				ID:   master,
-				Name: "Master Token",
-				Type: structs.ACLTypeManagement,
-			},
-		}
-		_, err := s.raftApply(structs.ACLRequestType, &req)
+	// Check for configured master token.
+	if master := s.config.ACLMasterToken; len(master) > 0 {
+		_, token, err = state.ACLTokenGetBySecret(nil, master)
 		if err != nil {
-			return fmt.Errorf("failed to create master token: %v", err)
+			return fmt.Errorf("failed to get master token: %v", err)
 		}
-
+		// Ignoring expiration times to avoid an insertion collision.
+		if token == nil {
+			req := structs.ACLRequest{
+				Datacenter: authDC,
+				Op:         structs.ACLSet,
+				ACL: structs.ACL{
+					ID:   master,
+					Name: "Master Token",
+					Type: structs.ACLTokenTypeManagement,
+				},
+			}
+			_, err := s.raftApply(structs.ACLRequestType, &req)
+			if err != nil {
+				return fmt.Errorf("failed to create master token: %v", err)
+			}
+			s.logger.Printf("[INFO] consul: Created ACL master token from configuration")
+		}
 	}
+
+	// Check to see if we need to initialize the ACL bootstrap info. This
+	// needs a Consul version check since it introduces a new Raft operation
+	// that'll produce an error on older servers, and it also makes a piece
+	// of state in the state store that will cause problems with older
+	// servers consuming snapshots, so we have to wait to create it.
+	var minVersion = version.Must(version.NewVersion("0.9.1"))
+	if ServersMeetMinimumVersion(s.LANMembers(), minVersion) {
+		canBootstrap, _, err := state.CanBootstrapACLToken()
+		if err != nil {
+			return fmt.Errorf("failed looking for ACL bootstrap info: %v", err)
+		}
+		if canBootstrap {
+			req := structs.ACLRequest{
+				Datacenter: authDC,
+				Op:         structs.ACLBootstrapInit,
+			}
+			resp, err := s.raftApply(structs.ACLRequestType, &req)
+			if err != nil {
+				return fmt.Errorf("failed to initialize ACL bootstrap: %v", err)
+			}
+			switch v := resp.(type) {
+			case error:
+				return fmt.Errorf("failed to initialize ACL bootstrap: %v", v)
+
+			case bool:
+				if v {
+					s.logger.Printf("[INFO] consul: ACL bootstrap enabled")
+				} else {
+					s.logger.Printf("[INFO] consul: ACL bootstrap disabled, existing management tokens found")
+				}
+
+			default:
+				return fmt.Errorf("unexpected response trying to initialize ACL bootstrap: %T", v)
+			}
+		}
+	} else {
+		s.logger.Printf("[WARN] consul: Can't initialize ACL bootstrap until all servers are >= %s", minVersion.String())
+	}
+
 	return nil
 }
 
+// initializeACLs is used to setup the ACLs if we are the leader
+// and need to do this.
+func (s *Server) initializeACLs(upgrade bool) error {
+	if !s.ACLsEnabled() {
+		return nil
+	}
+
+	// Purge the cache, since it could've changed while we were not the
+	// leader.
+	s.acls.cache.Purge()
+
+	// Purge the auth method validators since they could've changed while we
+	// were not leader.
+	s.purgeAuthMethodValidators()
+
+	// Remove any token affected by CVE-2019-8336
+	if !s.InACLDatacenter() {
+		_, token, err := s.fsm.State().ACLTokenGetBySecret(nil, redactedToken)
+		if err == nil && token != nil {
+			req := structs.ACLTokenBatchDeleteRequest{
+				TokenIDs: []string{token.AccessorID},
+			}
+
+			_, err := s.raftApply(structs.ACLTokenDeleteRequestType, &req)
+			if err != nil {
+				return fmt.Errorf("failed to remove token with a redacted secret: %v", err)
+			}
+		}
+	}
+
+	if s.InACLDatacenter() {
+		if s.UseLegacyACLs() && !upgrade {
+			s.logger.Printf("[INFO] acl: initializing legacy acls")
+			return s.initializeLegacyACL()
+		}
+
+		s.logger.Printf("[INFO] acl: initializing acls")
+
+		// Create the builtin global-management policy
+		_, policy, err := s.fsm.State().ACLPolicyGetByID(nil, structs.ACLPolicyGlobalManagementID)
+		if err != nil {
+			return fmt.Errorf("failed to get the builtin global-management policy")
+		}
+		if policy == nil {
+			policy := structs.ACLPolicy{
+				ID:          structs.ACLPolicyGlobalManagementID,
+				Name:        "global-management",
+				Description: "Builtin Policy that grants unlimited access",
+				Rules:       structs.ACLPolicyGlobalManagement,
+				Syntax:      acl.SyntaxCurrent,
+			}
+			policy.SetHash(true)
+
+			req := structs.ACLPolicyBatchSetRequest{
+				Policies: structs.ACLPolicies{&policy},
+			}
+			_, err := s.raftApply(structs.ACLPolicySetRequestType, &req)
+			if err != nil {
+				return fmt.Errorf("failed to create global-management policy: %v", err)
+			}
+			s.logger.Printf("[INFO] consul: Created ACL 'global-management' policy")
+		}
+
+		// Check for configured master token.
+		if master := s.config.ACLMasterToken; len(master) > 0 {
+			state := s.fsm.State()
+			if _, err := uuid.ParseUUID(master); err != nil {
+				s.logger.Printf("[WARN] consul: Configuring a non-UUID master token is deprecated")
+			}
+
+			_, token, err := state.ACLTokenGetBySecret(nil, master)
+			if err != nil {
+				return fmt.Errorf("failed to get master token: %v", err)
+			}
+			// Ignoring expiration times to avoid an insertion collision.
+			if token == nil {
+				accessor, err := lib.GenerateUUID(s.checkTokenUUID)
+				if err != nil {
+					return fmt.Errorf("failed to generate the accessor ID for the master token: %v", err)
+				}
+
+				token := structs.ACLToken{
+					AccessorID:  accessor,
+					SecretID:    master,
+					Description: "Master Token",
+					Policies: []structs.ACLTokenPolicyLink{
+						{
+							ID: structs.ACLPolicyGlobalManagementID,
+						},
+					},
+					CreateTime: time.Now(),
+					Local:      false,
+
+					// DEPRECATED (ACL-Legacy-Compat) - only needed for compatibility
+					Type: structs.ACLTokenTypeManagement,
+				}
+
+				token.SetHash(true)
+
+				done := false
+				if canBootstrap, _, err := state.CanBootstrapACLToken(); err == nil && canBootstrap {
+					req := structs.ACLTokenBootstrapRequest{
+						Token:      token,
+						ResetIndex: 0,
+					}
+					if _, err := s.raftApply(structs.ACLBootstrapRequestType, &req); err == nil {
+						s.logger.Printf("[INFO] consul: Bootstrapped ACL master token from configuration")
+						done = true
+					} else {
+						if err.Error() != structs.ACLBootstrapNotAllowedErr.Error() &&
+							err.Error() != structs.ACLBootstrapInvalidResetIndexErr.Error() {
+							return fmt.Errorf("failed to bootstrap master token: %v", err)
+						}
+					}
+				}
+
+				if !done {
+					// either we didn't attempt to or setting the token with a bootstrap request failed.
+					req := structs.ACLTokenBatchSetRequest{
+						Tokens: structs.ACLTokens{&token},
+						CAS:    false,
+					}
+					if _, err := s.raftApply(structs.ACLTokenSetRequestType, &req); err != nil {
+						return fmt.Errorf("failed to create master token: %v", err)
+					}
+
+					s.logger.Printf("[INFO] consul: Created ACL master token from configuration")
+				}
+			}
+		}
+
+		state := s.fsm.State()
+		_, token, err := state.ACLTokenGetBySecret(nil, structs.ACLTokenAnonymousID)
+		if err != nil {
+			return fmt.Errorf("failed to get anonymous token: %v", err)
+		}
+		// Ignoring expiration times to avoid an insertion collision.
+		if token == nil {
+			// DEPRECATED (ACL-Legacy-Compat) - Don't need to query for previous "anonymous" token
+			// check for legacy token that needs an upgrade
+			_, legacyToken, err := state.ACLTokenGetBySecret(nil, anonymousToken)
+			if err != nil {
+				return fmt.Errorf("failed to get anonymous token: %v", err)
+			}
+			// Ignoring expiration times to avoid an insertion collision.
+
+			// the token upgrade routine will take care of upgrading the token if a legacy version exists
+			if legacyToken == nil {
+				token = &structs.ACLToken{
+					AccessorID:  structs.ACLTokenAnonymousID,
+					SecretID:    anonymousToken,
+					Description: "Anonymous Token",
+					CreateTime:  time.Now(),
+				}
+				token.SetHash(true)
+
+				req := structs.ACLTokenBatchSetRequest{
+					Tokens: structs.ACLTokens{token},
+					CAS:    false,
+				}
+				_, err := s.raftApply(structs.ACLTokenSetRequestType, &req)
+				if err != nil {
+					return fmt.Errorf("failed to create anonymous token: %v", err)
+				}
+				s.logger.Printf("[INFO] consul: Created ACL anonymous token from configuration")
+			}
+		}
+		// launch the upgrade go routine to generate accessors for everything
+		s.startACLUpgrade()
+	} else {
+		if s.UseLegacyACLs() && !upgrade {
+			if s.IsACLReplicationEnabled() {
+				s.startLegacyACLReplication()
+			}
+		}
+
+		if upgrade {
+			s.stopACLReplication()
+		}
+
+		// ACL replication is now mandatory
+		s.startACLReplication()
+	}
+
+	s.startACLTokenReaping()
+
+	return nil
+}
+
+func (s *Server) startACLUpgrade() {
+	s.aclUpgradeLock.Lock()
+	defer s.aclUpgradeLock.Unlock()
+
+	if s.aclUpgradeEnabled {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.aclUpgradeCancel = cancel
+
+	go func() {
+		limiter := rate.NewLimiter(aclUpgradeRateLimit, int(aclUpgradeRateLimit))
+		for {
+			if err := limiter.Wait(ctx); err != nil {
+				return
+			}
+
+			// actually run the upgrade here
+			state := s.fsm.State()
+			tokens, waitCh, err := state.ACLTokenListUpgradeable(aclUpgradeBatchSize)
+			if err != nil {
+				s.logger.Printf("[WARN] acl: encountered an error while searching for tokens without accessor ids: %v", err)
+			}
+			// No need to check expiration time here, as that only exists for v2 tokens.
+
+			if len(tokens) == 0 {
+				ws := memdb.NewWatchSet()
+				ws.Add(state.AbandonCh())
+				ws.Add(waitCh)
+				ws.Add(ctx.Done())
+
+				// wait for more tokens to need upgrading or the aclUpgradeCh to be closed
+				ws.Watch(nil)
+				continue
+			}
+
+			var newTokens structs.ACLTokens
+			for _, token := range tokens {
+				// This should be entirely unnecessary but is just a small safeguard against changing accessor IDs
+				if token.AccessorID != "" {
+					continue
+				}
+
+				newToken := *token
+				if token.SecretID == anonymousToken {
+					newToken.AccessorID = structs.ACLTokenAnonymousID
+				} else {
+					accessor, err := lib.GenerateUUID(s.checkTokenUUID)
+					if err != nil {
+						s.logger.Printf("[WARN] acl: failed to generate accessor during token auto-upgrade: %v", err)
+						continue
+					}
+					newToken.AccessorID = accessor
+				}
+
+				// Assign the global-management policy to legacy management tokens
+				if len(newToken.Policies) == 0 &&
+					len(newToken.ServiceIdentities) == 0 &&
+					len(newToken.Roles) == 0 &&
+					newToken.Type == structs.ACLTokenTypeManagement {
+					newToken.Policies = append(newToken.Policies, structs.ACLTokenPolicyLink{ID: structs.ACLPolicyGlobalManagementID})
+				}
+
+				// need to copy these as we are going to do a CAS operation.
+				newToken.CreateIndex = token.CreateIndex
+				newToken.ModifyIndex = token.ModifyIndex
+
+				newToken.SetHash(true)
+
+				newTokens = append(newTokens, &newToken)
+			}
+
+			req := &structs.ACLTokenBatchSetRequest{Tokens: newTokens, CAS: true}
+
+			resp, err := s.raftApply(structs.ACLTokenSetRequestType, req)
+			if err != nil {
+				s.logger.Printf("[ERR] acl: failed to apply acl token upgrade batch: %v", err)
+			}
+
+			if err, ok := resp.(error); ok {
+				s.logger.Printf("[ERR] acl: failed to apply acl token upgrade batch: %v", err)
+			}
+		}
+	}()
+
+	s.aclUpgradeEnabled = true
+}
+
+func (s *Server) stopACLUpgrade() {
+	s.aclUpgradeLock.Lock()
+	defer s.aclUpgradeLock.Unlock()
+
+	if !s.aclUpgradeEnabled {
+		return
+	}
+
+	s.aclUpgradeCancel()
+	s.aclUpgradeCancel = nil
+	s.aclUpgradeEnabled = false
+}
+
+func (s *Server) startLegacyACLReplication() {
+	s.aclReplicationLock.Lock()
+	defer s.aclReplicationLock.Unlock()
+
+	if s.aclReplicationEnabled {
+		return
+	}
+
+	s.initReplicationStatus()
+	ctx, cancel := context.WithCancel(context.Background())
+	s.aclReplicationCancel = cancel
+
+	go func() {
+		var lastRemoteIndex uint64
+		limiter := rate.NewLimiter(rate.Limit(s.config.ACLReplicationRate), s.config.ACLReplicationBurst)
+
+		for {
+			if err := limiter.Wait(ctx); err != nil {
+				return
+			}
+
+			if s.tokens.ReplicationToken() == "" {
+				continue
+			}
+
+			index, exit, err := s.replicateLegacyACLs(lastRemoteIndex, ctx)
+			if exit {
+				return
+			}
+
+			if err != nil {
+				lastRemoteIndex = 0
+				s.updateACLReplicationStatusError()
+				s.logger.Printf("[WARN] consul: Legacy ACL replication error (will retry if still leader): %v", err)
+			} else {
+				lastRemoteIndex = index
+				s.updateACLReplicationStatusIndex(structs.ACLReplicateLegacy, index)
+				s.logger.Printf("[DEBUG] consul: Legacy ACL replication completed through remote index %d", index)
+			}
+		}
+	}()
+
+	s.updateACLReplicationStatusRunning(structs.ACLReplicateLegacy)
+	s.aclReplicationEnabled = true
+}
+
+func (s *Server) startACLReplication() {
+	s.aclReplicationLock.Lock()
+	defer s.aclReplicationLock.Unlock()
+
+	if s.aclReplicationEnabled {
+		return
+	}
+
+	s.initReplicationStatus()
+	ctx, cancel := context.WithCancel(context.Background())
+	s.aclReplicationCancel = cancel
+
+	s.startACLReplicator(ctx, structs.ACLReplicatePolicies, s.replicateACLPolicies)
+	s.startACLReplicator(ctx, structs.ACLReplicateRoles, s.replicateACLRoles)
+
+	if s.config.ACLTokenReplication {
+		s.startACLReplicator(ctx, structs.ACLReplicateTokens, s.replicateACLTokens)
+		s.updateACLReplicationStatusRunning(structs.ACLReplicateTokens)
+	} else {
+		s.updateACLReplicationStatusRunning(structs.ACLReplicatePolicies)
+	}
+
+	s.aclReplicationEnabled = true
+}
+
+type replicateFunc func(ctx context.Context, lastRemoteIndex uint64) (uint64, bool, error)
+
+func (s *Server) startACLReplicator(ctx context.Context, replicationType structs.ACLReplicationType, replicateFunc replicateFunc) {
+	go func() {
+		var failedAttempts uint
+		limiter := rate.NewLimiter(rate.Limit(s.config.ACLReplicationRate), s.config.ACLReplicationBurst)
+
+		var lastRemoteIndex uint64
+		for {
+			if err := limiter.Wait(ctx); err != nil {
+				return
+			}
+
+			if s.tokens.ReplicationToken() == "" {
+				continue
+			}
+
+			index, exit, err := replicateFunc(ctx, lastRemoteIndex)
+			if exit {
+				return
+			}
+
+			if err != nil {
+				lastRemoteIndex = 0
+				s.updateACLReplicationStatusError()
+				s.logger.Printf("[WARN] consul: ACL %s replication error (will retry if still leader): %v", replicationType.SingularNoun(), err)
+				if (1 << failedAttempts) < aclReplicationMaxRetryBackoff {
+					failedAttempts++
+				}
+
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After((1 << failedAttempts) * time.Second):
+					// do nothing
+				}
+			} else {
+				lastRemoteIndex = index
+				s.updateACLReplicationStatusIndex(replicationType, index)
+				s.logger.Printf("[DEBUG] consul: ACL %s replication completed through remote index %d", replicationType.SingularNoun(), index)
+				failedAttempts = 0
+			}
+		}
+	}()
+
+	s.logger.Printf("[INFO] acl: started ACL %s replication", replicationType.SingularNoun())
+}
+
+func (s *Server) stopACLReplication() {
+	s.aclReplicationLock.Lock()
+	defer s.aclReplicationLock.Unlock()
+
+	if !s.aclReplicationEnabled {
+		return
+	}
+
+	s.aclReplicationCancel()
+	s.aclReplicationCancel = nil
+	s.updateACLReplicationStatusStopped()
+	s.aclReplicationEnabled = false
+}
+
+func (s *Server) startConfigReplication() {
+	if s.config.PrimaryDatacenter == "" || s.config.PrimaryDatacenter == s.config.Datacenter {
+		// replication shouldn't run in the primary DC
+		return
+	}
+
+	s.configReplicator.Start()
+}
+
+func (s *Server) stopConfigReplication() {
+	// will be a no-op when not started
+	s.configReplicator.Stop()
+}
+
 // getOrCreateAutopilotConfig is used to get the autopilot config, initializing it if necessary
-func (s *Server) getOrCreateAutopilotConfig() (*structs.AutopilotConfig, bool) {
+func (s *Server) getOrCreateAutopilotConfig() *autopilot.Config {
 	state := s.fsm.State()
 	_, config, err := state.AutopilotConfig()
 	if err != nil {
 		s.logger.Printf("[ERR] autopilot: failed to get config: %v", err)
-		return nil, false
+		return nil
 	}
 	if config != nil {
-		return config, true
+		return config
 	}
 
 	if !ServersMeetMinimumVersion(s.LANMembers(), minAutopilotVersion) {
 		s.logger.Printf("[WARN] autopilot: can't initialize until all servers are >= %s", minAutopilotVersion.String())
-		return nil, false
+		return nil
 	}
 
 	config = s.config.AutopilotConfig
 	req := structs.AutopilotSetConfigRequest{Config: *config}
 	if _, err = s.raftApply(structs.AutopilotRequestType, req); err != nil {
 		s.logger.Printf("[ERR] autopilot: failed to initialize config: %v", err)
-		return nil, false
+		return nil
 	}
 
-	return config, true
+	return config
 }
 
-// reconcile is used to reconcile the differences between Serf
-// membership and what is reflected in our strongly consistent store.
-// Mainly we need to ensure all live nodes are registered, all failed
-// nodes are marked as such, and all left nodes are de-registered.
-func (s *Server) reconcile() (err error) {
-	defer metrics.MeasureSince([]string{"consul", "leader", "reconcile"}, time.Now())
-	members := s.serfLAN.Members()
-	knownMembers := make(map[string]struct{})
-	for _, member := range members {
-		if err := s.reconcileMember(member); err != nil {
-			return err
-		}
-		knownMembers[member.Name] = struct{}{}
+func (s *Server) bootstrapConfigEntries(entries []structs.ConfigEntry) error {
+	if s.config.PrimaryDatacenter != "" && s.config.PrimaryDatacenter != s.config.Datacenter {
+		// only bootstrap in the primary datacenter
+		return nil
 	}
 
-	// Reconcile any members that have been reaped while we were not the leader
-	return s.reconcileReaped(knownMembers)
+	if len(entries) < 1 {
+		// nothing to initialize
+		return nil
+	}
+
+	if !ServersMeetMinimumVersion(s.LANMembers(), minCentralizedConfigVersion) {
+		s.logger.Printf("[WARN] centralized config: can't initialize until all servers >= %s", minCentralizedConfigVersion.String())
+		return nil
+	}
+
+	state := s.fsm.State()
+	for _, entry := range entries {
+		// avoid a round trip through Raft if we know the CAS is going to fail
+		_, existing, err := state.ConfigEntry(nil, entry.GetKind(), entry.GetName())
+		if err != nil {
+			return fmt.Errorf("Failed to determine whether the configuration for %q / %q already exists: %v", entry.GetKind(), entry.GetName(), err)
+		}
+
+		if existing == nil {
+			// ensure the ModifyIndex is set to 0 for the CAS request
+			entry.GetRaftIndex().ModifyIndex = 0
+
+			req := structs.ConfigEntryRequest{
+				Op:         structs.ConfigEntryUpsertCAS,
+				Datacenter: s.config.Datacenter,
+				Entry:      entry,
+			}
+
+			if _, err = s.raftApply(structs.ConfigEntryRequestType, &req); err != nil {
+				return fmt.Errorf("Failed to apply configuration entry %q / %q: %v", entry.GetKind(), entry.GetName(), err)
+			}
+		}
+	}
+	return nil
+}
+
+// initializeCAConfig is used to initialize the CA config if necessary
+// when setting up the CA during establishLeadership
+func (s *Server) initializeCAConfig() (*structs.CAConfiguration, error) {
+	state := s.fsm.State()
+	_, config, err := state.CAConfig()
+	if err != nil {
+		return nil, err
+	}
+	if config != nil {
+		return config, nil
+	}
+
+	config = s.config.CAConfig
+	if config.ClusterID == "" {
+		id, err := uuid.GenerateUUID()
+		if err != nil {
+			return nil, err
+		}
+		config.ClusterID = id
+	}
+
+	req := structs.CARequest{
+		Op:     structs.CAOpSetConfig,
+		Config: config,
+	}
+	if _, err = s.raftApply(structs.ConnectCARequestType, req); err != nil {
+		return nil, err
+	}
+
+	return config, nil
+}
+
+// initializeRootCA runs the initialization logic for a root CA.
+func (s *Server) initializeRootCA(provider ca.Provider, conf *structs.CAConfiguration) error {
+	if err := provider.Configure(conf.ClusterID, true, conf.Config); err != nil {
+		return fmt.Errorf("error configuring provider: %v", err)
+	}
+	if err := provider.GenerateRoot(); err != nil {
+		return fmt.Errorf("error generating CA root certificate: %v", err)
+	}
+
+	// Get the active root cert from the CA
+	rootPEM, err := provider.ActiveRoot()
+	if err != nil {
+		return fmt.Errorf("error getting root cert: %v", err)
+	}
+
+	rootCA, err := parseCARoot(rootPEM, conf.Provider, conf.ClusterID)
+	if err != nil {
+		return err
+	}
+
+	// Check if the CA root is already initialized and exit if it is,
+	// adding on any existing intermediate certs since they aren't directly
+	// tied to the provider.
+	// Every change to the CA after this initial bootstrapping should
+	// be done through the rotation process.
+	state := s.fsm.State()
+	_, activeRoot, err := state.CARootActive(nil)
+	if err != nil {
+		return err
+	}
+	if activeRoot != nil {
+		// This state shouldn't be possible to get into because we update the root and
+		// CA config in the same FSM operation.
+		if activeRoot.ID != rootCA.ID {
+			return fmt.Errorf("stored CA root %q is not the active root (%s)", rootCA.ID, activeRoot.ID)
+		}
+
+		rootCA.IntermediateCerts = activeRoot.IntermediateCerts
+		s.setCAProvider(provider, rootCA)
+
+		return nil
+	}
+
+	// Get the highest index
+	idx, _, err := state.CARoots(nil)
+	if err != nil {
+		return err
+	}
+
+	// Store the root cert in raft
+	resp, err := s.raftApply(structs.ConnectCARequestType, &structs.CARequest{
+		Op:    structs.CAOpSetRoots,
+		Index: idx,
+		Roots: []*structs.CARoot{rootCA},
+	})
+	if err != nil {
+		s.logger.Printf("[ERR] connect: Apply failed %v", err)
+		return err
+	}
+	if respErr, ok := resp.(error); ok {
+		return respErr
+	}
+
+	s.setCAProvider(provider, rootCA)
+
+	s.logger.Printf("[INFO] connect: initialized primary datacenter CA with provider %q", conf.Provider)
+
+	return nil
+}
+
+// parseCARoot returns a filled-in structs.CARoot from a raw PEM value.
+func parseCARoot(pemValue, provider, clusterID string) (*structs.CARoot, error) {
+	id, err := connect.CalculateCertFingerprint(pemValue)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing root fingerprint: %v", err)
+	}
+	rootCert, err := connect.ParseCert(pemValue)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing root cert: %v", err)
+	}
+	return &structs.CARoot{
+		ID:                  id,
+		Name:                fmt.Sprintf("%s CA Root Cert", strings.Title(provider)),
+		SerialNumber:        rootCert.SerialNumber.Uint64(),
+		SigningKeyID:        connect.HexString(rootCert.SubjectKeyId),
+		ExternalTrustDomain: clusterID,
+		NotBefore:           rootCert.NotBefore,
+		NotAfter:            rootCert.NotAfter,
+		RootCert:            pemValue,
+		Active:              true,
+	}, nil
+}
+
+// createProvider returns a connect CA provider from the given config.
+func (s *Server) createCAProvider(conf *structs.CAConfiguration) (ca.Provider, error) {
+	switch conf.Provider {
+	case structs.ConsulCAProvider:
+		return &ca.ConsulProvider{Delegate: &consulCADelegate{s}}, nil
+	case structs.VaultCAProvider:
+		return &ca.VaultProvider{}, nil
+	default:
+		return nil, fmt.Errorf("unknown CA provider %q", conf.Provider)
+	}
+}
+
+func (s *Server) getCAProvider() (ca.Provider, *structs.CARoot) {
+	retries := 0
+	var result ca.Provider
+	var resultRoot *structs.CARoot
+	for result == nil {
+		s.caProviderLock.RLock()
+		result = s.caProvider
+		resultRoot = s.caProviderRoot
+		s.caProviderLock.RUnlock()
+
+		// In cases where an agent is started with managed proxies, we may ask
+		// for the provider before establishLeadership completes. If we're the
+		// leader, then wait and get the provider again
+		if result == nil && s.IsLeader() && retries < 10 {
+			retries++
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		break
+	}
+
+	return result, resultRoot
+}
+
+func (s *Server) setCAProvider(newProvider ca.Provider, root *structs.CARoot) {
+	s.caProviderLock.Lock()
+	defer s.caProviderLock.Unlock()
+	s.caProvider = newProvider
+	s.caProviderRoot = root
+}
+
+// startCARootPruning starts a goroutine that looks for stale CARoots
+// and removes them from the state store.
+func (s *Server) startCARootPruning() {
+	s.caPruningLock.Lock()
+	defer s.caPruningLock.Unlock()
+
+	if s.caPruningEnabled {
+		return
+	}
+
+	s.caPruningCh = make(chan struct{})
+
+	go func() {
+		ticker := time.NewTicker(caRootPruneInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-s.caPruningCh:
+				return
+			case <-ticker.C:
+				if err := s.pruneCARoots(); err != nil {
+					s.logger.Printf("[ERR] connect: error pruning CA roots: %v", err)
+				}
+			}
+		}
+	}()
+
+	s.caPruningEnabled = true
+}
+
+// pruneCARoots looks for any CARoots that have been rotated out and expired.
+func (s *Server) pruneCARoots() error {
+	if !s.config.ConnectEnabled {
+		return nil
+	}
+
+	state := s.fsm.State()
+	idx, roots, err := state.CARoots(nil)
+	if err != nil {
+		return err
+	}
+
+	_, caConf, err := state.CAConfig()
+	if err != nil {
+		return err
+	}
+
+	common, err := caConf.GetCommonConfig()
+	if err != nil {
+		return err
+	}
+
+	var newRoots structs.CARoots
+	for _, r := range roots {
+		if !r.Active && !r.RotatedOutAt.IsZero() && time.Since(r.RotatedOutAt) > common.LeafCertTTL*2 {
+			s.logger.Printf("[INFO] connect: pruning old unused root CA (ID: %s)", r.ID)
+			continue
+		}
+		newRoot := *r
+		newRoots = append(newRoots, &newRoot)
+	}
+
+	// Return early if there's nothing to remove.
+	if len(newRoots) == len(roots) {
+		return nil
+	}
+
+	// Commit the new root state.
+	var args structs.CARequest
+	args.Op = structs.CAOpSetRoots
+	args.Index = idx
+	args.Roots = newRoots
+	resp, err := s.raftApply(structs.ConnectCARequestType, args)
+	if err != nil {
+		return err
+	}
+	if respErr, ok := resp.(error); ok {
+		return respErr
+	}
+
+	return nil
+}
+
+// stopCARootPruning stops the CARoot pruning process.
+func (s *Server) stopCARootPruning() {
+	s.caPruningLock.Lock()
+	defer s.caPruningLock.Unlock()
+
+	if !s.caPruningEnabled {
+		return
+	}
+
+	close(s.caPruningCh)
+	s.caPruningEnabled = false
 }
 
 // reconcileReaped is used to reconcile nodes that have failed and been reaped
-// from Serf but remain in the catalog. This is done by looking for SerfCheckID
-// in a critical state that does not correspond to a known Serf member. We generate
-// a "reap" event to cause the node to be cleaned up.
+// from Serf but remain in the catalog. This is done by looking for unknown nodes with serfHealth checks registered.
+// We generate a "reap" event to cause the node to be cleaned up.
 func (s *Server) reconcileReaped(known map[string]struct{}) error {
 	state := s.fsm.State()
 	_, checks, err := state.ChecksInState(nil, api.HealthAny)
@@ -333,13 +1245,42 @@ func (s *Server) reconcileReaped(known map[string]struct{}) error {
 	}
 	for _, check := range checks {
 		// Ignore any non serf checks
-		if check.CheckID != SerfCheckID {
+		if check.CheckID != structs.SerfCheckID {
 			continue
 		}
 
 		// Check if this node is "known" by serf
 		if _, ok := known[check.Node]; ok {
 			continue
+		}
+
+		// Get the node services, look for ConsulServiceID
+		_, services, err := state.NodeServices(nil, check.Node)
+		if err != nil {
+			return err
+		}
+		serverPort := 0
+		serverAddr := ""
+		serverID := ""
+
+	CHECKS:
+		for _, service := range services.Services {
+			if service.ID == structs.ConsulServiceID {
+				_, node, err := state.GetNode(check.Node)
+				if err != nil {
+					s.logger.Printf("[ERR] consul: Unable to look up node with name %q: %v", check.Node, err)
+					continue CHECKS
+				}
+
+				serverAddr = node.Address
+				serverPort = service.Port
+				lookupAddr := net.JoinHostPort(serverAddr, strconv.Itoa(serverPort))
+				svr := s.serverLookup.Server(raft.ServerAddress(lookupAddr))
+				if svr != nil {
+					serverID = svr.ID
+				}
+				break
+			}
 		}
 
 		// Create a fake member
@@ -351,23 +1292,12 @@ func (s *Server) reconcileReaped(known map[string]struct{}) error {
 			},
 		}
 
-		// Get the node services, look for ConsulServiceID
-		_, services, err := state.NodeServices(nil, check.Node)
-		if err != nil {
-			return err
-		}
-		serverPort := 0
-		for _, service := range services.Services {
-			if service.ID == ConsulServiceID {
-				serverPort = service.Port
-				break
-			}
-		}
-
 		// Create the appropriate tags if this was a server node
 		if serverPort > 0 {
 			member.Tags["role"] = "consul"
 			member.Tags["port"] = strconv.FormatUint(uint64(serverPort), 10)
+			member.Tags["id"] = serverID
+			member.Addr = net.ParseIP(serverAddr)
 		}
 
 		// Attempt to reap this member
@@ -386,7 +1316,7 @@ func (s *Server) reconcileMember(member serf.Member) error {
 		s.logger.Printf("[WARN] consul: skipping reconcile of node %v", member)
 		return nil
 	}
-	defer metrics.MeasureSince([]string{"consul", "leader", "reconcileMember"}, time.Now())
+	defer metrics.MeasureSince([]string{"leader", "reconcileMember"}, time.Now())
 	var err error
 	switch member.Status {
 	case serf.StatusAlive:
@@ -403,10 +1333,9 @@ func (s *Server) reconcileMember(member serf.Member) error {
 			member, err)
 
 		// Permission denied should not bubble up
-		if strings.Contains(err.Error(), permissionDenied) {
+		if acl.IsErrPermissionDenied(err) {
 			return nil
 		}
-		return err
 	}
 	return nil
 }
@@ -416,7 +1345,9 @@ func (s *Server) shouldHandleMember(member serf.Member) bool {
 	if valid, dc := isConsulNode(member); valid && dc == s.config.Datacenter {
 		return true
 	}
-	if valid, parts := agent.IsConsulServer(member); valid && parts.Datacenter == s.config.Datacenter {
+	if valid, parts := metadata.IsConsulServer(member); valid &&
+		parts.Segment == "" &&
+		parts.Datacenter == s.config.Datacenter {
 		return true
 	}
 	return false
@@ -427,11 +1358,22 @@ func (s *Server) shouldHandleMember(member serf.Member) bool {
 func (s *Server) handleAliveMember(member serf.Member) error {
 	// Register consul service if a server
 	var service *structs.NodeService
-	if valid, parts := agent.IsConsulServer(member); valid {
+	if valid, parts := metadata.IsConsulServer(member); valid {
 		service = &structs.NodeService{
-			ID:      ConsulServiceID,
-			Service: ConsulServiceName,
+			ID:      structs.ConsulServiceID,
+			Service: structs.ConsulServiceName,
 			Port:    parts.Port,
+			Weights: &structs.Weights{
+				Passing: 1,
+				Warning: 1,
+			},
+			Meta: map[string]string{
+				"raft_version":          strconv.Itoa(parts.RaftVersion),
+				"serf_protocol_current": strconv.FormatUint(uint64(member.ProtocolCur), 10),
+				"serf_protocol_min":     strconv.FormatUint(uint64(member.ProtocolMin), 10),
+				"serf_protocol_max":     strconv.FormatUint(uint64(member.ProtocolMax), 10),
+				"version":               parts.Build.String(),
+			},
 		}
 
 		// Attempt to join the consul server
@@ -472,7 +1414,7 @@ func (s *Server) handleAliveMember(member serf.Member) error {
 			return err
 		}
 		for _, check := range checks {
-			if check.CheckID == SerfCheckID && check.Status == api.HealthPassing {
+			if check.CheckID == structs.SerfCheckID && check.Status == api.HealthPassing {
 				return nil
 			}
 		}
@@ -489,16 +1431,17 @@ AFTER_CHECK:
 		Service:    service,
 		Check: &structs.HealthCheck{
 			Node:    member.Name,
-			CheckID: SerfCheckID,
-			Name:    SerfCheckName,
+			CheckID: structs.SerfCheckID,
+			Name:    structs.SerfCheckName,
 			Status:  api.HealthPassing,
-			Output:  SerfCheckAliveOutput,
+			Output:  structs.SerfCheckAliveOutput,
 		},
-
-		// If there's existing information about the node, do not
-		// clobber it.
-		SkipNodeUpdate: true,
 	}
+	if node != nil {
+		req.TaggedAddresses = node.TaggedAddresses
+		req.NodeMeta = node.Meta
+	}
+
 	_, err = s.raftApply(structs.RegisterRequestType, &req)
 	return err
 }
@@ -512,14 +1455,20 @@ func (s *Server) handleFailedMember(member serf.Member) error {
 	if err != nil {
 		return err
 	}
-	if node != nil && node.Address == member.Addr.String() {
+
+	if node == nil {
+		s.logger.Printf("[INFO] consul: ignoring failed event for member '%s' because it does not exist in the catalog", member.Name)
+		return nil
+	}
+
+	if node.Address == member.Addr.String() {
 		// Check if the serfCheck is in the critical state
 		_, checks, err := state.NodeChecks(nil, member.Name)
 		if err != nil {
 			return err
 		}
 		for _, check := range checks {
-			if check.CheckID == SerfCheckID && check.Status == api.HealthCritical {
+			if check.CheckID == structs.SerfCheckID && check.Status == api.HealthCritical {
 				return nil
 			}
 		}
@@ -534,10 +1483,10 @@ func (s *Server) handleFailedMember(member serf.Member) error {
 		Address:    member.Addr.String(),
 		Check: &structs.HealthCheck{
 			Node:    member.Name,
-			CheckID: SerfCheckID,
-			Name:    SerfCheckName,
+			CheckID: structs.SerfCheckID,
+			Name:    structs.SerfCheckName,
 			Status:  api.HealthCritical,
-			Output:  SerfCheckFailedOutput,
+			Output:  structs.SerfCheckFailedOutput,
 		},
 
 		// If there's existing information about the node, do not
@@ -571,7 +1520,7 @@ func (s *Server) handleDeregisterMember(reason string, member serf.Member) error
 	}
 
 	// Remove from Raft peers if this was a server
-	if valid, parts := agent.IsConsulServer(member); valid {
+	if valid, parts := metadata.IsConsulServer(member); valid {
 		if err := s.removeConsulServer(member, parts.Port); err != nil {
 			return err
 		}
@@ -598,17 +1547,12 @@ func (s *Server) handleDeregisterMember(reason string, member serf.Member) error
 }
 
 // joinConsulServer is used to try to join another consul server
-func (s *Server) joinConsulServer(m serf.Member, parts *agent.Server) error {
-	// Do not join ourself
-	if m.Name == s.config.NodeName {
-		return nil
-	}
-
+func (s *Server) joinConsulServer(m serf.Member, parts *metadata.Server) error {
 	// Check for possibility of multiple bootstrap nodes
 	if parts.Bootstrap {
 		members := s.serfLAN.Members()
 		for _, member := range members {
-			valid, p := agent.IsConsulServer(member)
+			valid, p := metadata.IsConsulServer(member)
 			if valid && member.Name != m.Name && p.Bootstrap {
 				s.logger.Printf("[ERR] consul: '%v' and '%v' are both in bootstrap mode. Only one node should be in bootstrap mode, not adding Raft peer.", m.Name, member.Name)
 				return nil
@@ -616,20 +1560,28 @@ func (s *Server) joinConsulServer(m serf.Member, parts *agent.Server) error {
 		}
 	}
 
-	addr := (&net.TCPAddr{IP: m.Addr, Port: parts.Port}).String()
-
-	minRaftProtocol, err := ServerMinRaftProtocol(s.serfLAN.Members())
-	if err != nil {
+	// Processing ourselves could result in trying to remove ourselves to
+	// fix up our address, which would make us step down. This is only
+	// safe to attempt if there are multiple servers available.
+	configFuture := s.raft.GetConfiguration()
+	if err := configFuture.Error(); err != nil {
+		s.logger.Printf("[ERR] consul: failed to get raft configuration: %v", err)
 		return err
+	}
+	if m.Name == s.config.NodeName {
+		if l := len(configFuture.Configuration().Servers); l < 3 {
+			s.logger.Printf("[DEBUG] consul: Skipping self join check for %q since the cluster is too small", m.Name)
+			return nil
+		}
 	}
 
 	// See if it's already in the configuration. It's harmless to re-add it
 	// but we want to avoid doing that if possible to prevent useless Raft
 	// log entries. If the address is the same but the ID changed, remove the
 	// old server before adding the new one.
-	configFuture := s.raft.GetConfiguration()
-	if err := configFuture.Error(); err != nil {
-		s.logger.Printf("[ERR] consul: failed to get raft configuration: %v", err)
+	addr := (&net.TCPAddr{IP: m.Addr, Port: parts.Port}).String()
+	minRaftProtocol, err := s.autopilot.MinRaftProtocol()
+	if err != nil {
 		return err
 	}
 	for _, server := range configFuture.Configuration().Servers {
@@ -682,10 +1634,7 @@ func (s *Server) joinConsulServer(m serf.Member, parts *agent.Server) error {
 	}
 
 	// Trigger a check to remove dead servers
-	select {
-	case s.autopilotRemoveDeadCh <- struct{}{}:
-	default:
-	}
+	s.autopilot.RemoveDeadServers()
 
 	return nil
 }
@@ -703,12 +1652,12 @@ func (s *Server) removeConsulServer(m serf.Member, port int) error {
 		return err
 	}
 
-	minRaftProtocol, err := ServerMinRaftProtocol(s.serfLAN.Members())
+	minRaftProtocol, err := s.autopilot.MinRaftProtocol()
 	if err != nil {
 		return err
 	}
 
-	_, parts := agent.IsConsulServer(m)
+	_, parts := metadata.IsConsulServer(m)
 
 	// Pick which remove API to use based on how the server was added.
 	for _, server := range configFuture.Configuration().Servers {
@@ -745,7 +1694,7 @@ func (s *Server) removeConsulServer(m serf.Member, port int) error {
 // through Raft to ensure consistency. We do this outside the leader loop
 // to avoid blocking.
 func (s *Server) reapTombstones(index uint64) {
-	defer metrics.MeasureSince([]string{"consul", "leader", "reapTombstones"}, time.Now())
+	defer metrics.MeasureSince([]string{"leader", "reapTombstones"}, time.Now())
 	req := structs.TombstoneRequest{
 		Datacenter: s.config.Datacenter,
 		Op:         structs.TombstoneReap,
